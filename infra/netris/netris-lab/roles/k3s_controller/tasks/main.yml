@@ -27,7 +27,12 @@
 
 - name: Install K3s
   when: k3s_check.rc != 0
-  shell: "curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION={{ k3s_version }} sh -"
+  ansible.builtin.shell:
+    cmd: |
+      set -o pipefail
+      curl --fail --silent --show-error --location https://get.k3s.io \
+        | INSTALL_K3S_VERSION={{ k3s_version }} sh -
+    executable: /bin/bash
   register: k3s_install
 
 - name: Ensure K3s is running
@@ -248,6 +253,7 @@
     daemon_reload: true
 
 - name: Verify controller API
+  no_log: true
   uri:
     url: "http://localhost:{{ controller_nodeport }}/api/auth"
     method: POST
@@ -265,6 +271,7 @@
   register: license_file
 
 - name: Apply license via collection
+  no_log: true
   when: license_file.stat.exists
   ansible.builtin.include_role:
     name: netris.controller.license
