@@ -272,11 +272,7 @@ class WorkflowExporter:
         suffix match (e.g. "e2e-caas-gate") or one of GATE_JOB_NAMES.
         """
         lname = (name or "").lower()
-        return (
-            lname.endswith(WorkflowExporter.GATE_NAME_SUFFIX)
-            or lname in WorkflowExporter.GATE_JOB_NAMES
-            or WorkflowExporter._is_orchestration_job(lname)
-        )
+        return lname.endswith(WorkflowExporter.GATE_NAME_SUFFIX) or lname in WorkflowExporter.GATE_JOB_NAMES
 
     # The pull-request flow's own workflows (osac-ci's shared flow, called from
     # each repo's e2e-pr.yml / e2e-queue.yml / e2e-review-relay.yml). One run of
@@ -322,6 +318,13 @@ class WorkflowExporter:
         return bool(WorkflowExporter.ORCHESTRATION_JOB_RE.match((name or "").strip()))
 
     @staticmethod
+    def _is_plumbing(job):
+        """A job that is not a test: a gate/precondition job (any workflow), or an
+        orchestration job of the pull-request flow (marked by
+        _refine_pipeline_category, only in that flow's own workflows)."""
+        return bool(job.get("pipeline_plumbing")) or WorkflowExporter._is_gate_job(job.get("name"))
+
+    @staticmethod
     def _is_suite_job(job):
         return bool(WorkflowExporter.SUITE_JOB_RE.search((job.get("name") or "").strip()))
 
@@ -345,10 +348,13 @@ class WorkflowExporter:
     def _refine_pipeline_category(record, jobs, active=False):
         """The pull-request flow's workflows count as "e2e" only when a suite
         job really ran in the run, otherwise they stay "automation". Called
-        wherever the run's jobs are known, before the failure is classified
-        (which only looks at "e2e" records). No-op for any other workflow."""
+        wherever the run's jobs are known, before their steps and failures are
+        read (it also marks the orchestration jobs as plumbing). No-op for any other workflow."""
         if record.get("workflow") not in WorkflowExporter.PIPELINE_WORKFLOW_NAMES:
             return
+        for j in jobs or []:
+            if WorkflowExporter._is_orchestration_job(j.get("name")):
+                j["pipeline_plumbing"] = True
         ran = any(WorkflowExporter._suite_job_ran(j, active) for j in jobs or [])
         record["category"] = "e2e" if ran else "automation"
 
@@ -367,7 +373,7 @@ class WorkflowExporter:
         failed_jobs = [j for j in (jobs or []) if j.get("conclusion") == "failure"]
         if not failed_jobs:
             return False
-        return all(WorkflowExporter._is_gate_job(j.get("name")) for j in failed_jobs)
+        return all(WorkflowExporter._is_plumbing(j) for j in failed_jobs)
 
     @staticmethod
     def _classify_failure_reason(category, failed_steps, jobs=None):
@@ -1714,7 +1720,7 @@ class WorkflowExporter:
         """
         failed_steps = []
         for job in jobs:
-            if self._is_gate_job(job.get("name")):
+            if self._is_plumbing(job):
                 continue
             if job.get("conclusion") != "failure":
                 continue
@@ -1734,7 +1740,7 @@ class WorkflowExporter:
         """
         steps = []
         for job in jobs:
-            if self._is_gate_job(job.get("name")):
+            if self._is_plumbing(job):
                 continue
             if job.get("conclusion") not in ("success", "failure"):
                 continue
@@ -1832,10 +1838,10 @@ class WorkflowExporter:
                         run_id, repo,
                     )
                     continue
+                self._refine_pipeline_category(record, jobs)
                 if jobs:
                     record["runner_name"] = self._extract_runner_names(jobs)
                     record["steps"] = self._extract_step_durations(jobs)
-                self._refine_pipeline_category(record, jobs)
                 self._apply_ai_status(record, jobs)
                 if conclusion == "failure":
                     # jobs may be [] (fetch succeeded, zero job entries) --
@@ -1908,10 +1914,10 @@ class WorkflowExporter:
                     run_id, repo,
                 )
                 continue
+            self._refine_pipeline_category(record, jobs)
             if jobs:
                 record["runner_name"] = self._extract_runner_names(jobs)
                 record["steps"] = self._extract_step_durations(jobs)
-            self._refine_pipeline_category(record, jobs)
             self._apply_ai_status(record, jobs)
             if conclusion == "failure":
                 # jobs may be [] (fetch succeeded, zero job entries) --
@@ -1999,10 +2005,10 @@ class WorkflowExporter:
                             run_id, repo,
                         )
                         continue
+                    self._refine_pipeline_category(record, jobs)
                     if jobs:
                         record["runner_name"] = self._extract_runner_names(jobs)
                         record["steps"] = self._extract_step_durations(jobs)
-                    self._refine_pipeline_category(record, jobs)
                     self._apply_ai_status(record, jobs)
                     if conclusion == "failure":
                         # jobs may be [] (fetch succeeded, zero job entries)
@@ -2054,10 +2060,10 @@ class WorkflowExporter:
             )
             return False
         failed = []
+        self._refine_pipeline_category(record, jobs)
         if jobs:
             record["runner_name"] = self._extract_runner_names(jobs)
             record["steps"] = self._extract_step_durations(jobs)
-        self._refine_pipeline_category(record, jobs)
         self._apply_ai_status(record, jobs)
         if conclusion == "failure":
             # jobs may be [] (fetch succeeded, zero job entries)
