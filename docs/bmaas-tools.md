@@ -92,7 +92,40 @@ KUBECONFIG=/path/to/kubeconfig python3 .github/scripts/reconcile-bmhs.py \
   --namespace host-inventory
 ```
 
-## 6. Clean up
+## 6. Reconcile the NetBox inventory instead
+
+When the cluster's bare-metal fulfillment runs the NetBox inventory
+backend, the same raw inventory drives NetBox devices instead of
+BareMetalHosts — the operator creates each BMH itself when it claims a
+device. Needs the `osac` CLI on PATH, logged in, and the NetBox
+endpoint and token (`pynetbox` comes with this repository's Python
+environment):
+
+```bash
+python3 .github/scripts/reconcile-netbox-devices.py \
+  --inventory-file "${HOME}/virtual-bmh-inventory.json" \
+  --url https://netbox.example.test \
+  --token-file netbox-token.txt
+```
+
+Inside a cluster over plain HTTP (NetBox behind a service, token from
+the deployment), pass `--insecure`:
+
+```bash
+OSAC_NETBOX_URL=http://osac-infra-netbox.osac-infra.svc.cluster.local \
+OSAC_NETBOX_TOKEN="${NETBOX_TOKEN}" \
+python3 .github/scripts/reconcile-netbox-devices.py \
+  --inventory-file "${HOME}/virtual-bmh-inventory.json" --insecure
+```
+
+One staged device per host, stamped with the OSAC custom fields, plus
+one BMC Secret per host in the OSAC Secret API, labeled for its device.
+The NetBox schema (site, role, manufacturer, device type, custom
+fields) is bootstrapped when missing. Idempotent — re-running creates
+nothing — and an emptied inventory removes the whole group, devices and
+Secrets: that is the NetBox-mode cleanup path.
+
+## 7. Clean up
 
 ```bash
 # remove every VM — this empties the inventory
