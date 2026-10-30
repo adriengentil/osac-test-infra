@@ -25,6 +25,7 @@ python3 -I .github/scripts/test_ai_diagnose_failure.py
 python3 -I .github/scripts/test_manage_virtual_bmh_vms.py
 python3 -I .github/scripts/test_raw_inventory.py
 python3 -I .github/scripts/test_reconcile_bmhs.py
+python3 -I .github/scripts/test_reconcile_netbox_devices.py
 python3 -I .github/scripts/test_upsert_pr_comment.py
 bash .github/scripts/discover-audit-runs-test.sh
 ```
