@@ -34,6 +34,7 @@
 #                      superuser Secret the NetBox chart pre-provisions.
 #   NETBOX_NAMESPACE — namespace of the NetBox release (default: osac-infra)
 #   NETBOX_SERVICE   — NetBox service name (default: osac-infra-netbox)
+#   NETBOX_ALLOW_HTTP — explicit consent for a passed plain-HTTP URL
 #   NETBOX_SECRET    — NetBox superuser Secret name (default:
 #                      osac-infra-netbox-superuser)
 #
@@ -117,6 +118,16 @@ fi
 # service port to the loopback unless an URL was given (a route, a lab
 # NetBox). The forward dies with this script — the reconcile is the only
 # consumer.
+# A plain-HTTP URL that is passed in needs NETBOX_ALLOW_HTTP=true as
+# explicit consent — the token would cross the network unencrypted.
+# The loopback port-forward this script starts when no URL is given needs
+# no consent: the token never leaves the runner.
+if [[ -n "${NETBOX_URL:-}" && "${NETBOX_URL}" == http://* && "${NETBOX_ALLOW_HTTP:-}" != "true" ]]; then
+  echo "ERROR: NETBOX_URL ${NETBOX_URL} uses plain HTTP." >&2
+  echo "       Set NETBOX_ALLOW_HTTP=true to consent to sending the NetBox token unencrypted, or use an https URL." >&2
+  exit 1
+fi
+
 RECONCILE_ARGS=(--inventory-file "${INVENTORY_FILE}")
 if [[ -n "${NETBOX_URL:-}" ]]; then
   PORT_FORWARD_LOG=""
@@ -141,8 +152,9 @@ else
   done
 fi
 
-# Plain HTTP — the port-forward, or an in-cluster service URL — needs the
-# reconcile's explicit opt-in; an https URL keeps TLS verification.
+# Plain HTTP — a consented passed URL, or the script's own loopback
+# port-forward — needs the reconcile's explicit opt-in; an https URL
+# keeps TLS verification.
 if [[ "${NETBOX_URL}" == http://* ]]; then
   RECONCILE_ARGS+=(--insecure)
 fi

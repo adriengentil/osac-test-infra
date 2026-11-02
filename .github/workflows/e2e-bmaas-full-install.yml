@@ -384,12 +384,6 @@ jobs:
           BMH_NAMESPACE: ${{ inputs.bmh-namespace }}
         run: bash .github/scripts/setup-virtual-bmh.sh
 
-      - name: Setup virtual NetBox devices
-        if: inputs.inventory-backend == 'netbox'
-        env:
-          KUBECONFIG: ${{ runner.temp }}/kubeconfig
-        run: bash .github/scripts/setup-virtual-netbox-devices.sh
-
       # Loops over the `components` JSON array so any number of components
       # (one, two, or the 5-8 this repo is headed toward) can be built from
       # source in a single e2e run -- fixed named inputs (component-repo,
@@ -768,6 +762,27 @@ jobs:
           done
 
       # Telemetry-only: computes the recorded test selection for the
+      # NetBox device setup needs everything the reconciler drives: NetBox
+      # (deployed by install-infra's bmaas-netbox-ci profile), the OSAC
+      # Secret API (install-osac), and the extracted osac CLI -- so it runs
+      # here, after the install, instead of next to the metal3 BMH setup.
+      # The reconciler creates system-scoped BMC Secrets through the private
+      # API: the CLI is logged in with a cluster-admin token, matching the
+      # e2e conftest's private-client pattern.
+      - name: Setup virtual NetBox devices
+        if: inputs.inventory-backend == 'netbox'
+        env:
+          KUBECONFIG: ${{ runner.temp }}/kubeconfig
+          INSTALLER_NAMESPACE: ${{ inputs.namespace }}
+        run: |
+          export PATH="${OSAC_CLI_BIN%/*}:${PATH}"
+          DOMAIN="$(oc get ingress.config.openshift.io cluster -o jsonpath='{.spec.domain}')"
+          osac login \
+            --address "https://fulfillment-internal-api-${INSTALLER_NAMESPACE}.${DOMAIN}" \
+            --insecure --private \
+            --token-script "oc create token -n ${INSTALLER_NAMESPACE} admin --as system:admin --duration=2h"
+          bash .github/scripts/setup-virtual-netbox-devices.sh
+
       # ci-observe capture (BMaaS has no suite fallback step -- the raw
       # test-suite input is exactly what the test steps run). Pure string
       # computation over the same env the test steps read; it cannot fail
