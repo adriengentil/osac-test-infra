@@ -66,10 +66,11 @@ python3 .github/scripts/manage-virtual-bmh-vms.py create \
   --redfish-host "${GW_IP}" \
   --count 1
 
-# remove one by name
+# remove one by name — the full '<name_prefix>-<token>' form, e.g.
+# virtual-bmh-9f2b7c31-3f; the inventory's hosts[].name entries list them
 python3 .github/scripts/manage-virtual-bmh-vms.py delete \
   --inventory-file "${HOME}/virtual-bmh-inventory.json" \
-  virtual-bmh-3f
+  "$(jq -r '.hosts[0].name' "${HOME}/virtual-bmh-inventory.json")"
 ```
 
 ## 4. Activate Ironic
