@@ -61,6 +61,13 @@ SUSHY_CACHE_NAME="sushy-cache-${CLONE_NAME}"
 SUSHY_VMEDIA_TMP="${HOME}/sushy-vmedia-tmp-${CLONE_NAME}"
 INVENTORY_FILE="${HOME}/virtual-bmh-inventory-${CLONE_NAME}.json"
 
+# Export the path before any VM exists: when a later step fails, failure
+# artifacts (gather-osac-logs.sh) still find the inventory — including a
+# partially written one, which the redaction at collection handles.
+if [[ -n "${GITHUB_ENV:-}" ]]; then
+  echo "INVENTORY_FILE=${INVENTORY_FILE}" >> "${GITHUB_ENV}"
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VIRSH="virsh -c qemu:///system"
 
@@ -134,13 +141,23 @@ if [[ -n "${NETBOX_URL:-}" ]]; then
 else
   echo "==> Port-forwarding the NetBox service..."
   PORT_FORWARD_LOG="${HOME}/netbox-port-forward-${CLONE_NAME}.log"
+  # Local port 0: pick a free port instead of a fixed one, so concurrent
+  # jobs on the same runner never collide (and a probe can never be
+  # answered by another job's forward).
   oc port-forward -n "${NETBOX_NAMESPACE}" "svc/${NETBOX_SERVICE}" \
-    "${NETBOX_PORT_FORWARD_PORT}:80" >"${PORT_FORWARD_LOG}" 2>&1 &
+    0:80 >"${PORT_FORWARD_LOG}" 2>&1 &
   PORT_FORWARD_PID=$!
   trap 'kill "${PORT_FORWARD_PID}" 2>/dev/null || true' EXIT
-  NETBOX_URL="http://127.0.0.1:${NETBOX_PORT_FORWARD_PORT}"
+  NETBOX_URL=""
   for attempt in $(seq 1 30); do
-    if curl -sf "${NETBOX_URL}/api/" >/dev/null 2>&1; then
+    if ! kill -0 "${PORT_FORWARD_PID}" 2>/dev/null; then
+      echo "ERROR: the NetBox port-forward exited before becoming ready." >&2
+      tail "${PORT_FORWARD_LOG}" >&2 || true
+      exit 1
+    fi
+    assigned="$(grep -oE '127\.0\.0\.1:[0-9]+' "${PORT_FORWARD_LOG}" | head -1 || true)"
+    if [[ -n "${assigned}" ]] && curl -sf "http://${assigned}/api/" >/dev/null 2>&1; then
+      NETBOX_URL="http://${assigned}"
       break
     fi
     if [[ "${attempt}" -eq 30 ]]; then
@@ -162,17 +179,11 @@ fi
 # --- Reconcile the NetBox devices and BMC Secrets with the raw inventory ---
 # The runner's python3 is not the repository environment: install the
 # pynetbox version the repository's uv.lock pins (requests comes along).
-pip install --quiet 'pynetbox==7.8.0'
+pip install --quiet 'pynetbox==7.8.0' 'requests==2.34.2'
 
 OSAC_NETBOX_URL="${NETBOX_URL}" \
 OSAC_NETBOX_TOKEN="${NETBOX_TOKEN}" \
   python3 "${SCRIPT_DIR}/reconcile-netbox-devices.py" "${RECONCILE_ARGS[@]}"
-
-# Make the raw inventory path available to later workflow steps (it is
-# also fixed and derivable from CLONE_NAME).
-if [[ -n "${GITHUB_ENV:-}" ]]; then
-  echo "INVENTORY_FILE=${INVENTORY_FILE}" >> "${GITHUB_ENV}"
-fi
 
 echo "==> Virtual NetBox device setup complete. ${BMH_COUNT} devices staged."
 echo "Raw inventory: ${INVENTORY_FILE}"
