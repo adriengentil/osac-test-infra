@@ -81,7 +81,12 @@ Cluster-level configuration. Idempotent:
 KUBECONFIG=/path/to/kubeconfig bash .github/scripts/activate-ironic.sh
 ```
 
-## 5. Reconcile the BMH inventory on the cluster
+## 5. Reconcile the inventory on the cluster
+
+Both backends consume the same raw inventory; run the one matching the
+cluster's bare-metal fulfillment inventory backend.
+
+### Metal3 — BareMetalHosts
 
 One command applies new and changed hosts and removes the ones the
 inventory no longer lists:
@@ -92,7 +97,7 @@ KUBECONFIG=/path/to/kubeconfig python3 .github/scripts/reconcile-bmhs.py \
   --namespace host-inventory
 ```
 
-## 6. Reconcile the NetBox inventory instead
+### NetBox — devices
 
 When the cluster's bare-metal fulfillment runs the NetBox inventory
 backend, the same raw inventory drives NetBox devices instead of
@@ -125,7 +130,7 @@ fields) is bootstrapped when missing. Idempotent — re-running creates
 nothing — and an emptied inventory removes the whole group, devices and
 Secrets: that is the NetBox-mode cleanup path.
 
-## 7. Clean up
+## 6. Clean up
 
 ```bash
 # remove every VM — this empties the inventory
