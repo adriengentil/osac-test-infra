@@ -40,6 +40,9 @@ if TYPE_CHECKING:
 
 # 300s: a hung CLI must fail, not hang the job.
 OSAC_TIMEOUT_SECONDS = 300
+# NetBox HTTP calls: requests has no default timeout, and a stalled
+# connection would hang the step until the job timeout kills it.
+NETBOX_TIMEOUT_SECONDS = 30
 
 T = TypeVar("T")
 
@@ -81,18 +84,28 @@ def run_osac(args: list[str], *, check: bool = True) -> subprocess.CompletedProc
 def build_netbox_api(url: str, token: str, ca_file: str | None, insecure: bool) -> Api:
     """Construct the pynetbox API; third-party imports stay lazy.
 
-    A dedicated session is only needed to customize TLS verification;
-    the default session verifies against the system roots.
+    The session always mounts a timeout adapter: a plain requests.Session
+    has no default timeout, so a stalled NetBox connection would hang the
+    step until the job timeout kills it. TLS verification is customized
+    only when a CA file or the insecure opt-in is given; otherwise the
+    session verifies against the system roots.
     """
     import pynetbox
+    import requests
+    from requests.adapters import HTTPAdapter
+
+    class TimeoutAdapter(HTTPAdapter):
+        def send(self, request, **kwargs):
+            kwargs["timeout"] = kwargs.get("timeout") or NETBOX_TIMEOUT_SECONDS
+            return super().send(request, **kwargs)
 
     api = pynetbox.api(url, token=token)
+    session = requests.Session()
+    session.mount("http://", TimeoutAdapter())
+    session.mount("https://", TimeoutAdapter())
     if ca_file is not None or insecure:
-        import requests
-
-        session = requests.Session()
         session.verify = ca_file if ca_file is not None else False
-        api.http_session = session
+    api.http_session = session
     return api
 
 
@@ -113,7 +126,9 @@ def run_netbox(operation: str, call: Callable[[], T]) -> T:
         status = getattr(req, "status_code", "?")
         url = getattr(req, "url", None) or getattr(exc, "base", "<unknown endpoint>")
         method = getattr(getattr(req, "request", None), "method", "?")
-        raise RuntimeError(f"NetBox {operation} failed: {method} {url} -> HTTP {status}") from exc
+        # from None: chaining would print the original RequestError (and its
+        # response body) in the unhandled traceback, defeating the sanitizer.
+        raise RuntimeError(f"NetBox {operation} failed: {method} {url} -> HTTP {status}") from None
 
 
 def _ensure_slug_record(
@@ -238,8 +253,11 @@ def reconcile_devices(
         if name in desired_names:
             continue
         print(f"  Deleting {name} (no longer in the inventory)...")
-        delete_device(api, device)
+        # Secret first: if the device deletion then fails, the device stays
+        # listed and the rerun retries both. The other order could succeed at
+        # the device and orphan the Secret — nothing would list it anymore.
         delete_bmc_secret(args, name)
+        delete_device(api, device)
     device_ids = {name: str(device.id) for name, device in existing.items() if name in desired_names}
     for host in inventory.hosts:
         if host.name in device_ids:
@@ -340,7 +358,9 @@ def resolve_connection(args: argparse.Namespace) -> tuple[str, str, str | None, 
         fail("NetBox URL is empty: pass --url or set OSAC_NETBOX_URL")
     if not token:
         fail("NetBox token is empty: pass --token/--token-file or set OSAC_NETBOX_TOKEN")
-    if url.startswith("http://") and not insecure:
+    # Scheme check is case-insensitive: requests accepts HTTP:// and would
+    # otherwise send the token over plaintext without the opt-in.
+    if url[:7].lower() == "http://" and not insecure:
         fail(f"NetBox URL {url!r} uses http://: pass --insecure (or set OSAC_NETBOX_INSECURE) to allow it")
     return url, token, ca_file, insecure
 
@@ -395,6 +415,10 @@ def main(argv: list[str] | None = None) -> None:
         fail(str(exc))
     except FileNotFoundError as exc:
         fail(f"required command not found: {exc}")
+    except RuntimeError as exc:
+        # Sanitized NetBox/osac failures: clean exit instead of a traceback
+        # (which would print the chained, unsanitized original error).
+        fail(str(exc))
     print(f"==> {len(inventory.hosts)} NetBox devices staged.")
 
 
