@@ -237,6 +237,11 @@ class FakeBins:
     def env(self, **extra: str) -> dict[str, str]:
         """A test-process environment with the fakes on PATH."""
         env = os.environ.copy()
+        # Scripts under test read OSAC_NETBOX_* fallbacks; a value leaking
+        # from the caller's shell (an e2e workflow sets them) would change
+        # behavior. Tests add them back explicitly through env_extra.
+        for key in [k for k in env if k.startswith("OSAC_NETBOX_")]:
+            del env[key]
         env.update(
             {
                 "PATH": f"{self.bin_dir}:{env['PATH']}",

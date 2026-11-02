@@ -192,8 +192,9 @@ STUB_PYNETBOX = textwrap.dedent(
     '''
 )
 
-# A stub requests package: the script only builds a Session to override
-# TLS verification, so the setter records what the script configured.
+# A stub requests package: the script builds a Session to mount the
+# timeout adapters and to override TLS verification; both record what the
+# script configured.
 STUB_REQUESTS = textwrap.dedent(
     '''\
     import json
@@ -213,6 +214,20 @@ STUB_REQUESTS = textwrap.dedent(
             self._verify = value
             with Path(os.environ["NETBOX_CALLS_FILE"]).open("a") as handle:
                 handle.write(json.dumps({"op": "session", "verify": value}) + "\\n")
+
+        def mount(self, prefix, adapter):
+            with Path(os.environ["NETBOX_CALLS_FILE"]).open("a") as handle:
+                handle.write(json.dumps({"op": "mount", "prefix": prefix}) + "\\n")
+    '''
+)
+
+# The script imports requests.adapters.HTTPAdapter to build its timeout
+# adapter; the stub class only needs to exist for the subclassing.
+STUB_REQUESTS_ADAPTERS = textwrap.dedent(
+    '''\
+    class HTTPAdapter:
+        def send(self, request, **kwargs):
+            raise NotImplementedError
     '''
 )
 
@@ -280,6 +295,7 @@ class EndToEndTests(unittest.TestCase):
         (stub_dir / "pynetbox" / "__init__.py").write_text(STUB_PYNETBOX)
         (stub_dir / "requests").mkdir(parents=True)
         (stub_dir / "requests" / "__init__.py").write_text(STUB_REQUESTS)
+        (stub_dir / "requests" / "adapters.py").write_text(STUB_REQUESTS_ADAPTERS)
 
         self.state_file = self.temp / "netbox-state.json"
         self.netbox_calls_file = self.temp / "netbox-calls.jsonl"
@@ -522,6 +538,17 @@ class EndToEndTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(
             [call for call in self._netbox_calls() if call["op"] == "session"], [{"op": "session", "verify": False}]
+        )
+
+    def test_session_mounts_timeout_adapters(self) -> None:
+        result = self._run(
+            flags=[],
+            env_extra={"OSAC_NETBOX_URL": "https://env.example.test", "OSAC_NETBOX_TOKEN": "env-token"},
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(
+            [call for call in self._netbox_calls() if call["op"] == "mount"],
+            [{"op": "mount", "prefix": "http://"}, {"op": "mount", "prefix": "https://"}],
         )
 
     def test_env_vars_configure_the_connection(self) -> None:
