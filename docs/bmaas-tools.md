@@ -21,7 +21,7 @@ cache. The listen IP is the libvirt network's gateway — the cluster
 nodes must reach the emulated BMCs:
 
 ```bash
-GW_IP=$(virsh net-dumpxml default | sed -n "s/.*<ip address='\([^']*\)'.*/\1/p")
+GW_IP=$(virsh -c qemu:///system net-dumpxml default | sed -n "s/.*<ip address='\([^']*\)'.*/\1/p")
 
 SUSHY_LISTEN_IP="${GW_IP}" \
 STORAGE_POOL_NAME="bmh-local" \
@@ -133,21 +133,30 @@ Secrets: that is the NetBox-mode cleanup path.
 
 ## 6. Clean up
 
+`set -e` stops the block at the first failure, so the `rm -rf` only runs
+after the deletions succeeded.
+
 ```bash
+set -e
 # remove every VM — this empties the inventory
 python3 .github/scripts/manage-virtual-bmh-vms.py delete \
   --inventory-file "${HOME}/virtual-bmh-inventory.json" \
   $(jq -r '.hosts[].name' "${HOME}/virtual-bmh-inventory.json")
 
-# reconcile the emptied inventory: every BMH of the group goes too
+# reconcile the emptied inventory: every BMH of the group goes too.
+# NetBox backend: same inventory, same connection settings as step 5 —
+# the emptied inventory removes the group's devices and BMC Secrets.
 KUBECONFIG=/path/to/kubeconfig python3 .github/scripts/reconcile-bmhs.py \
   --inventory-file "${HOME}/virtual-bmh-inventory.json" \
   --namespace host-inventory
+# OSAC_NETBOX_URL=... OSAC_NETBOX_TOKEN=... \
+#   python3 .github/scripts/reconcile-netbox-devices.py \
+#   --inventory-file "${HOME}/virtual-bmh-inventory.json"
 
 # host side
 kill "$(cat "${HOME}/sushy-local/sushy.pid")"
 podman rm --force sushy-cache-local && podman volume rm sushy-cache-local
-virsh pool-destroy bmh-local && virsh pool-undefine bmh-local
+virsh -c qemu:///system pool-destroy bmh-local && virsh -c qemu:///system pool-undefine bmh-local
 rm -rf "${HOME}/virtual-bmh-disks" "${HOME}/sushy-local" \
   "${HOME}/sushy-vmedia-tmp" "${HOME}/virtual-bmh-inventory.json"
 ```

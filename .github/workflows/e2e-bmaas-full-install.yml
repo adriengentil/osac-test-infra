@@ -188,6 +188,12 @@ jobs:
       BMAAS_PROFILE: ${{ inputs.inventory-backend == 'netbox' && 'bmaas-netbox-ci' || 'bmaas-ci' }}
 
     steps:
+      - name: Validate inventory backend
+        if: inputs.inventory-backend != 'metal3' && inputs.inventory-backend != 'netbox'
+        run: |
+          echo "ERROR: inventory-backend must be 'metal3' or 'netbox', got '${{ inputs.inventory-backend }}'." >&2
+          exit 1
+
       - name: Checkout repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -761,7 +767,6 @@ jobs:
             sleep 2
           done
 
-      # Telemetry-only: computes the recorded test selection for the
       # NetBox device setup needs everything the reconciler drives: NetBox
       # (deployed by install-infra's bmaas-netbox-ci profile), the OSAC
       # Secret API (install-osac), and the extracted osac CLI -- so it runs
@@ -775,7 +780,11 @@ jobs:
           KUBECONFIG: ${{ runner.temp }}/kubeconfig
           INSTALLER_NAMESPACE: ${{ inputs.namespace }}
         run: |
-          export PATH="${OSAC_CLI_BIN%/*}:${PATH}"
+          # The extracted binary is named osac-cli-bin; expose it as `osac`
+          # on PATH for both this login and reconcile-netbox-devices.py.
+          CLI_DIR="$(mktemp -d)"
+          ln -s "${OSAC_CLI_BIN}" "${CLI_DIR}/osac"
+          export PATH="${CLI_DIR}:${PATH}"
           DOMAIN="$(oc get ingress.config.openshift.io cluster -o jsonpath='{.spec.domain}')"
           osac login \
             --address "https://fulfillment-internal-api-${INSTALLER_NAMESPACE}.${DOMAIN}" \
@@ -783,6 +792,7 @@ jobs:
             --token-script "oc create token -n ${INSTALLER_NAMESPACE} admin --as system:admin --duration=2h"
           bash .github/scripts/setup-virtual-netbox-devices.sh
 
+      # Telemetry-only: computes the recorded test selection for the
       # ci-observe capture (BMaaS has no suite fallback step -- the raw
       # test-suite input is exactly what the test steps run). Pure string
       # computation over the same env the test steps read; it cannot fail
@@ -958,6 +968,7 @@ jobs:
               -e OSAC_NAMESPACE="${OSAC_NAMESPACE}" \
               -e OSAC_BMI_TEMPLATE="${OSAC_BMI_TEMPLATE}" \
               -e OSAC_BMH_NAMESPACE="${OSAC_BMH_NAMESPACE}" \
+              -e OSAC_INVENTORY_BACKEND="${INVENTORY_BACKEND}" \
               -e OSAC_PULL_SECRET_PATH=/root/pull-secret \
               -e OTEL_EXPORTER_OTLP_ENDPOINT \
               -e OTEL_EXPORTER_OTLP_TIMEOUT \
