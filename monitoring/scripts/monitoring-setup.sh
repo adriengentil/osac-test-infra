@@ -591,6 +591,11 @@ if [[ "${MODE}" == "update-central" ]]; then
        "${MONITORING_HOME}/scripts/workflow-exporter.py"
     cp "${MONITORING_REPO_DIR}/scripts/ci_observe_run_evidence.py" \
        "${MONITORING_HOME}/scripts/ci_observe_run_evidence.py"
+    # The per-test rollup the ci-observe Trends dashboard reads (trends.db).
+    # Run from here by hand or by a timer; it is not part of the exporter.
+    cp "${MONITORING_REPO_DIR}/scripts/ci_observe_trends.py" \
+       "${MONITORING_HOME}/scripts/ci_observe_trends.py"
+    chmod +x "${MONITORING_HOME}/scripts/ci_observe_trends.py"
     info "Config files + scripts updated."
 
     # The prometheus.yml copy above just brought in the repo's template
@@ -612,6 +617,10 @@ if [[ "${MODE}" == "update-central" ]]; then
        "${SYSTEMD_USER_DIR}/service-health-textfile.service"
     cp "${MONITORING_REPO_DIR}/systemd/service-health-textfile.timer" \
        "${SYSTEMD_USER_DIR}/service-health-textfile.timer"
+    cp "${MONITORING_REPO_DIR}/systemd/ci-observe-trends.service" \
+       "${SYSTEMD_USER_DIR}/ci-observe-trends.service"
+    cp "${MONITORING_REPO_DIR}/systemd/ci-observe-trends.timer" \
+       "${SYSTEMD_USER_DIR}/ci-observe-trends.timer"
     # Refresh the tunnel template too (OSAC-2206 added a second -L forward
     # to it) -- this was previously never refreshed by --update-central at
     # all, so a template change would silently never reach production
@@ -648,6 +657,7 @@ if [[ "${MODE}" == "update-central" ]]; then
         systemctl --user restart "${svc}"
     done
     systemctl --user restart service-health-textfile.timer
+    systemctl --user enable --now ci-observe-trends.timer
 
     info "Central update complete."
     exit 0
@@ -761,6 +771,10 @@ cp "${MONITORING_REPO_DIR}/scripts/service-health-textfile.sh" \
    "${MONITORING_HOME}/scripts/service-health-textfile.sh"
 chmod +x "${MONITORING_HOME}/scripts/service-health-textfile.sh"
 info "Installed service-health-textfile.sh"
+cp "${MONITORING_REPO_DIR}/scripts/ci_observe_trends.py" \
+   "${MONITORING_HOME}/scripts/ci_observe_trends.py"
+chmod +x "${MONITORING_HOME}/scripts/ci_observe_trends.py"
+info "Installed ci_observe_trends.py"
 
 ###############################################################################
 # Phase 3: Deploy Quadlet units
@@ -804,6 +818,12 @@ if [[ "${MODE}" == "central" ]]; then
         info "Installed ${unit}"
     done
 
+    cp "${MONITORING_REPO_DIR}/systemd/ci-observe-trends.service" \
+       "${SYSTEMD_USER_DIR}/ci-observe-trends.service"
+    cp "${MONITORING_REPO_DIR}/systemd/ci-observe-trends.timer" \
+       "${SYSTEMD_USER_DIR}/ci-observe-trends.timer"
+    info "Installed ci-observe-trends.service + .timer"
+
     # Install the SSH tunnel template unit
     cp "${MONITORING_REPO_DIR}/systemd/monitoring-tunnel@.service" \
        "${SYSTEMD_USER_DIR}/monitoring-tunnel@.service"
@@ -811,6 +831,9 @@ if [[ "${MODE}" == "central" ]]; then
 fi
 
 systemctl --user daemon-reload
+if [[ "${MODE}" == "central" ]]; then
+    systemctl --user enable ci-observe-trends.timer
+fi
 
 ###############################################################################
 # Phase 4: Start services and wait for containers
@@ -835,6 +858,7 @@ CENTRAL_SERVICES=(
     "workflow-exporter.service"
     "caddy.service"
     "ci-observe-tempo210.service"
+    "ci-observe-trends.timer"
 )
 
 for svc in "${COMMON_SERVICES[@]}"; do
