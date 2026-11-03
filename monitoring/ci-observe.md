@@ -1,7 +1,9 @@
-# Collector-first local investigation
+# ci-observe operator reference
 
-This prototype uses standard OpenTelemetry collection to investigate existing OSAC tests locally.
-The application and individual tests keep their current source and behavior.
+This is the operator reference for ci-observe, the telemetry path that records OSAC E2E runs.
+For an introduction, start with [ci-observe/README.md](ci-observe/README.md).
+
+The application and the individual tests keep their current source and behavior.
 
 ## Status at the 2026-11-01 cutover
 
@@ -12,16 +14,17 @@ against the central backend on `osac-ci-1`:
   logs and kubelet metrics to the central backend while the test runs. Nothing is
   uploaded to GitHub, so the capture step needs no artifact and no gitleaks scan.
 - The dashboard shows real numbers for a finished capture: 17 tests, 24.1 minutes
-  run duration, the slowest-test table with per-test durations.
+  run duration, the slowest-test table with per-test durations. Run duration
+  uses the single `test run` session span, not the separate xdist worker spans.
 - Every E2E wait is a named span (`poll_until` in the osac repo). The 16-minute
   bmaas metering test breaks down into named waits: instance RUNNING 282 s,
   metering heartbeats 60 s, instance deletion 243 s.
 - Kubelet metrics arrive: the cluster panels show node and pod CPU and memory.
 - Capture ids are readable (`bmaas-main-<run-id>-a1`), with suite and PR promoted
   to Loki and Prometheus labels.
-- Delivery is verified after each test: the capture action fails the job when
-  telemetry was requested but never reached the backend. The test's own exit code
-  stays the run step's outcome.
+- Delivery is verified after each test: the capture action reports a loud,
+  non-gating error when telemetry was requested but never reached the backend.
+  The job result and the test's own exit code stay unchanged.
 - Traces from the batch era stay queryable through the archive datasource. The
   31 batch session traces were migrated into Tempo 2.10.
 
@@ -32,8 +35,8 @@ What is missing or known gaps:
 - The Traces Drilldown app (v3.1.0) is installed and served but not yet confirmed
   rendering in a user's browser. Explore with query type Trace ID is the working
   path to a trace waterfall today.
-- Count stat panels render with an `ns` suffix (`17 ns`). The Tempo field carries
-  a nanosecond unit and the stat inherits it. Cosmetic, unfixed.
+- Count stat panels render unitless (`47`, not `47 ns`); `Run duration` keeps its
+  time unit. Verified in Grafana 13.2.4.
 - The router keeps its sending queues in memory. A router restart while a backend
   is down discards already accepted batches. Persistent queue storage is a
   follow-up, not part of the cutover.
@@ -48,13 +51,12 @@ What is missing or known gaps:
 
 ## Scope
 
-The first milestone collects test phases, Go service requests and selected cluster evidence.
-It saves standard telemetry files near the workload, then imports them into a local Grafana development stack.
-GitHub artifact delivery and automatic CI activation follow local acceptance.
-
-The local backend is Grafana's `otel-lgtm` development image. Beyla observes Go requests.
-A stock Pytest plugin supplies test context. OpenTelemetry Collector Contrib collects and replays the data.
+ci-observe collects test phases, Go service requests and selected cluster evidence for E2E runs.
+A pytest plugin supplies test context, Beyla observes Go requests, and OpenTelemetry Collector Contrib collects and forwards the data.
 There is no new database schema, custom exporter or per-test registration.
+
+The central backend is Grafana's `otel-lgtm` image: Grafana with Tempo, Loki and Prometheus.
+It runs on `osac-ci-1`, next to the Tempo 2.10 instance that holds the newer traces.
 
 ## Current validation
 
@@ -132,28 +134,127 @@ capture identity) live to the central backend while the test runs:
 - Nothing touches GitHub: no capture artifact, no upload gate, no scan.
   Telemetry is visible in the CI Grafana during the run.
 
-Every captured signal also carries the run identity as `osac.ci.*`
-resource attributes, so a span answers "what exactly ran?". Two of them
-are git refs, and each is true in every flow: `test_ref` is the osac code
-under test, `test_infra_ref` the test-infra harness revision (the
-workflow, scripts and actions that orchestrate the run). The others are
-`workflow`, `run_attempt`, and `osac_images` (the OSAC images deployed on
-the cluster, one `deployment=image1,image2` entry per deployment,
-`;`-separated on a single line).
+Every captured signal carries run identity and test selection as `osac.ci.*`
+resource attributes. The fields distinguish requested refs, resolved source
+SHAs, deployment image refs, runtime image IDs and pytest selection:
 
-| Flow | `osac.ci.test_ref` | `osac.ci.test_infra_ref` |
-| --- | --- | --- |
-| osac PR flow (osac's callers pin these workflows and pass both refs) | osac PR head SHA | the test-infra ref osac passes (`main` unless the osac PR pins one) |
-| test-infra PR flow (this repo's own PRs) | `main` | test-infra PR head SHA |
-| This repo's scheduled / dispatched runs | `main` (input default) | the workflow's own SHA (`GITHUB_SHA`) |
-| osac's scheduled runs (through osac's callers) | osac main HEAD SHA (osac passes `test-ref: inputs.sha or github.sha`) | `main` (osac passes `test-infra-ref: main`) |
-| Local capture | `unknown` (no osac ref locally) | local `git rev-parse HEAD` |
+| Attribute | Meaning |
+| --- | --- |
+| `test_ref` | The osac ref the caller requested. It can be a branch name (`main` on schedules) or a commit SHA; a moving ref can advance between dispatch and checkout, so this alone does not prove what ran. |
+| `test_sha` | The exact commit the osac test source checkout resolved (the overlay step's `git rev-parse HEAD` after `checkout FETCH_HEAD`). A 40/64 lowercase hex SHA or `unknown`; never the requested ref. |
+| `test_infra_ref` | The test-infra ref the caller requested. `unspecified` when the caller did not request one. |
+| `test_infra_sha` | The workspace commit whose five harness files (the capture action, the capture supervisor and the three collector configs) are tracked at HEAD and byte-identical to the copies this job runs. `unknown` when any check fails. |
+| `test_infra_workflow_sha` | `job.workflow_sha`: the commit of the reusable workflow file that defines the `e2e` job. |
+| `test_suite` | The exact pytest path arguments the test command ran, e.g. `tests/e2e/vmaas/ tests/e2e/references/`; `tests/e2e/` when no suite was selected. `unknown` when the caller reported no selection. |
+| `test_filter` | The exact pytest `-k` expression, or `none` when the run passed no filter. |
+| `test_marker` | The exact pytest `-m` expression, or `none` when the run passed no marker. |
+| `osac_images` | The Deployment spec image refs (including mutable tags) requested for the OSAC workloads. This existing attribute is unchanged. |
+| `osac_image_ids` | Runtime IDs from Running OSAC Deployment pods, plus `=unknown` entries for expected containers without enough IDs. A truncated list ends in `...[truncated]`. |
+| `osac_image_ids_complete` | `true` only when every desired replica had an image ID and the list was not truncated. `false` marks missing IDs or truncation; `unknown` marks an unavailable query. |
+| `workflow`, `run_attempt` | GitHub workflow name and attempt number. |
 
-On the spans they stay unindexed resource attributes, like the capture
-id. A value the coordinator cannot determine degrades to `unknown` —
-never empty, which the collector rejects at config load — and a ref that
-does not parse as a git ref (characters outside letters, digits,
-`. _ / + -`) degrades to `unknown` whole rather than a mangled value.
+The source- and image-identity values answer different questions, and none
+stands in for another:
+
+| Value | Kind | What it proves | What it does not prove |
+| --- | --- | --- | --- |
+| `test_ref` | requested ref | What the caller asked to test | Which commit actually ran |
+| `test_sha` | resolved SHA | Which osac commit the overlay checkout resolved and the tests ran from | Which test-infra harness wrapped the run |
+| `test_infra_ref` | requested ref | Which harness ref the caller asked for (often `unspecified`) | Which harness commit ran |
+| `test_infra_sha` | resolved SHA | The harness files this job runs are byte-identical to this commit's | That the whole checkout matches (the overlay replaces `tests/`); which workflow file called the action |
+| `test_infra_workflow_sha` | resolved SHA | The commit of the reusable workflow file that defines this job | The checkout SHA of any repository |
+| `osac_images` | image refs | What the Deployment specs asked the cluster to run | What image bytes the kubelet actually pulled |
+| `osac_image_ids` | runtime IDs | What the kubelet reports running, per deployment container | That the spec refs were honored (a mutated tag can differ) |
+
+GitHub defines [`job.workflow_sha`](https://docs.github.com/en/actions/reference/workflows-and-actions/contexts#job-context)
+as the SHA of the workflow file that defines the current job. The same
+documentation shows a reusable workflow using `job.workflow_sha` and
+`job.workflow_repository` to check out its own source. These full-install
+files define the `e2e` job and declare `workflow_call`, so this is the called
+reusable workflow's SHA, not the caller's SHA. GitHub also documents that a
+same-repository `./.github/workflows/...` call uses the caller's commit for
+the called file. In this repo the checkout step uses `job.workflow_sha` as
+its same-repository fallback. `github.workflow_sha` and `GITHUB_WORKFLOW_SHA`
+describe the workflow run; `GITHUB_SHA` describes the triggering event. None
+proves which alternate test-infra checkout ran.
+
+The action records `git rev-parse HEAD` from the workspace its local
+action and scripts run in, but only after `git cat-file -e HEAD:<path>`
+proves every one of the five harness files is tracked at HEAD and `git
+diff --quiet HEAD` proves the worktree copies are byte-identical: `git
+diff` alone reports no difference for a path HEAD does not contain, which
+would claim a commit that never had the running file. The overlay step's
+`tests/` replacement never matters because only the five harness paths
+are checked. Missing git, a dirty worktree or an untracked replacement
+all keep the conservative `unknown`. (Precision note: `git update-index
+--assume-unchanged` or `--skip-worktree` could make a modified harness file
+look clean to `git diff`; the CI checkout never sets those flags, so the
+proof holds there.) On scheduled runs the checkout
+defaults to `job.workflow_sha`, so `test_infra_sha` and
+`test_infra_workflow_sha` are expected to match there; on this repo's PR
+flows the checkout is the test-infra PR head, and the two SHAs differ by
+design.
+
+`osac_images` and `osac_image_ids` answer different questions. The first
+keeps the requested Deployment spec refs, including mutable tags. The second
+reads `.status.containerStatuses[].imageID` only from Running pods owned by
+Deployments labeled `app.kubernetes.io/part-of=osac`. It compares those IDs
+with every declared OSAC Deployment container and its desired replica count.
+Missing IDs appear as `deployment/container=unknown`; the completeness
+attribute is false. The helper preserves underscores, rejects
+unsafe image ID characters and hostile deployment names (degrading the
+whole value to `unknown`) instead of rewriting them, sorts the mappings
+and caps the value at 4 KiB. If the cap cuts the list, `...[truncated]`
+marks the end and completeness stays false. A scaled-to-zero Deployment
+records `=unknown` for its containers: it declares no running replica,
+so no runtime image evidence exists. Kubernetes formats `imageID` by runtime; it is
+often a pullable digest reference, but the attribute preserves the reported
+ID rather than claiming every runtime returns a registry digest.
+
+The suite, filter and marker stay unindexed resource attributes. The
+recorded suite is the exact path list pytest received, computed in each
+workflow's resolve step from the same effective suite and marker the test
+steps read, including the `references/` addition a marker triggers for
+vmaas, bmaas and the caas/caas-regression directories (the
+`monitoring/tests` suite pins the recorded selection to the test steps'
+own computation). Values are rendered as JSON-quoted YAML strings with
+`$` defused, so a custom expression remains exact without changing the
+test command. Suite values over 256 UTF-8 bytes and filters or markers
+over 512 UTF-8 bytes become `unknown`; CI emits a warning. Empty filter
+or marker values become `none` (the wired callers pass them only when
+the command really ran without `-k`/`-m`); an empty suite selection
+means no selection was reported and records `unknown`. Local captures
+use `local` for the suite, `none` for filter and marker, and `unknown`
+for `test_sha` and the workflow SHA: a local run wraps an arbitrary
+command with no osac checkout to resolve.
+
+The standard full-install flows record:
+
+| Flow | `test_suite` | `test_filter` | `test_marker` |
+| --- | --- | --- | --- |
+| VMaaS PR, merge queue and schedule | `tests/e2e/vmaas/ tests/e2e/references/` | `none` | `not requires_caas and not requires_bmaas` |
+| CaaS PR and merge queue | `tests/e2e/caas/sanity/` | `none` | `sanity` |
+| CaaS schedule | `tests/e2e/caas/ tests/e2e/references/` | `none` | `sanity or regression or requires_caas or reference_common` |
+| BMaaS PR and merge queue | `tests/e2e/bmaas/sanity/` | `not TestBmaasNetworking` | `none` |
+| BMaaS schedule | `tests/e2e/bmaas/serial/` | `not TestBmaasNetworking` | `none` |
+
+Workflow dispatch records the effective suite and exact filter and marker
+inputs selected for that run. VMaaS records the resolved tier fallback, if a
+requested tier contains no tests. If the coordinator cannot determine a
+value, it uses a non-empty `unknown` or `none` value because the collector
+rejects empty resource attributes. Invalid refs and SHAs become `unknown`
+whole, never a mangled value.
+
+These identity attributes are wired end to end, but only a live capture
+exercises the full chain: the workflow context, the overlay step output,
+the workspace git metadata and the cluster queries. A post-merge canary
+run with the `ci-observe` input or label must show, in the CI Grafana
+for its capture id: `test_ref` equal to the requested ref, `test_sha`
+matching the osac commit the run's overlay step logged, `test_infra_sha`
+matching the merged test-infra commit (equal to
+`test_infra_workflow_sha` on a scheduled run), `test_suite` naming every
+path the pytest log collected, and `osac_image_ids` populated with
+`osac_image_ids_complete=true`.
 
 The `ci-observe-sync.yml` workflow is no longer scheduled: live pushes made
 it unnecessary for new runs, and its 15-minute backend restart would drop
@@ -175,11 +276,12 @@ monitoring-central runner, and nothing else. It deliberately has no
 schedule, for the same batch-dropping reason.
 
 The capture action verifies delivery after the test: it scrapes the gateway
-collector's self-metrics (`:8888`) and fails the job when telemetry was
+collector's self-metrics (`:8888`) and reports an error when telemetry was
 requested but never reached the central backend (deployment failed, receiver
 refused data, exporter send failures, sent less than accepted, or nothing
-collected at all). The failure message always says the test result above is
-unaffected — the test's own exit code stays the run step's outcome.
+collected at all). The verify step has `continue-on-error: true`, so the error
+is loud but never gating: the job result and the test's own exit code stay
+unchanged.
 
 The backend uses the persistent state directory `~/monitoring/ci-observe` and
 fixed loopback ports: UI 3300, OTLP 4318, Tempo 3200, Loki 3100 and Prometheus

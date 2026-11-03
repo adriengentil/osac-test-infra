@@ -298,7 +298,8 @@ VMaaS EVPN runs the OSAC Netris Fabric Manager (`osac.templates.netris`) and the
 
 | Value | Source |
 |-------|--------|
-| `global.networking.provisioningEnabled: true`, `fabricManager: netris` | `netris.yaml` for vmaas, bmaas, full; the runtime file for caas and maas |
+| `global.networking.provisioningEnabled` | `networking_provisioning_enabled` in inventory/EXTRA_VARS (default: `true`) |
+| `fabricManager: netris` | `netris-runtime.yaml`, generated after the optional profile overlay for all deployment suites |
 | `global.networking.k8sManager` | `netris.yaml`: `cudn_evpn` for vmaas and full, `""` for bmaas; caas-ci's profile value otherwise (prep-osac asserts vmaas, full and bmaas) |
 | `global.networking.networkClass.defaults` | `virtualNetworkIPv4CIDR` and `subnetIPv4CIDR` from `netris_tenant_network_cidr` / `netris_tenant_subnet_cidr` (`192.168.101.0/24`, the CaaS tenant default network) |
 | `global.networking.excludedIpv4Cidrs` | computed: all of `10.0.0.0/8` (the Netris private allocation; tenant networks must not use 10.x, the E2E suites use 172.16-172.31 except 172.27 and 172.30), the bare-metal resolver `/32` (`dns_server`, handed to bare metal by the Netris default DHCP option set), OCP SNAT/DNAT `/32`, node subnet, `192.168.16.0/20`, BMC network, provisioning SNAT range, then from `.evpn-values.yaml` the VTEP CIDR, the Netris loopbacks (`acceptPrefixes`) and the node uplink networks, plus `netris_extra_excluded_cidrs` |
@@ -573,7 +574,9 @@ Then browse to `https://osac-ui-osac-devel.apps.ocp-sno.osac.local:9444` (accept
 | Assisted Installer UI | `http://<server-ip>:8080` |
 | Netris Controller | `http://<server-ip>:9443` |
 
-`make ingress-forward` reconciles the forwarded endpoints on a running cluster. It points Keycloak (`KC_HOSTNAME`) and every issuer consumer at `:9444`, adds a host alias so the UI, fulfillment and operator pods resolve the Keycloak route to the lab host, and allows the forwarded callback on the `osac-ui` Keycloak client. `make deploy-osac` and `make post-install` run it, and it is idempotent.
+`make ingress-forward` reconciles the forwarded endpoints on a running cluster. It points Keycloak (`KC_HOSTNAME`) and every issuer consumer at `:9444`, adds a host alias so the UI, fulfillment, operator and bundled OpenBao pods resolve the Keycloak route to the lab host, and allows the forwarded callback on the `osac-ui` Keycloak client. `make deploy-osac` and `make post-install` run it, and it is idempotent.
+
+`ingress_forward_alias_deployments` remains a list of deployment names in `osac_namespace`. Additional namespace-aware targets are configured with `ingress_forward_extra_alias_deployments`, a list of mappings with `namespace` and `deployment` keys. Its default targets `osac-infra/openbao`; absent deployments are skipped. Set it to `[]` when no additional targets are wanted. The OpenBao entry also sets `keycloak_issuer_container: bootstrap`, which updates that container's `KEYCLOAK_ISSUER_URL` together with the host alias in one pod-template patch. This keeps OIDC discovery coherent when the bootstrap sidecar runs again after the rollout, without changing CA trust or the initial Helm installation order. Alias reconciliation, rollout waiting and verification use the same combined target list.
 
 ## How deploy-ocp Works
 
@@ -622,7 +625,8 @@ Common overrides:
 | Option | Example | Use |
 |---|---|---|
 | `dns_server` | `EXTRA_VARS="dns_server=<reachable-dns-server>"` | The bare-metal resolver, which the Netris default DHCP option set hands to bare metal, and the lab resolver. Change it when public DNS is unavailable. Default: `8.8.8.8`. Set it permanently as `dns_server` in [`inventory/group_vars/all.yml`](inventory/group_vars/all.yml); a per-run `EXTRA_VARS` value has the highest precedence. |
-| `osac_branch` | `EXTRA_VARS="osac_branch=my-branch"` | Install OSAC charts from a mono-repo branch. |
+| `osac_branch` | `EXTRA_VARS="osac_branch=my-branch"` | Install OSAC charts from a mono-repo branch. When setting `networking_provisioning_enabled=false`, use a branch with the shared setting and Fulfillment checks; `main` includes them from OSAC PR #1989. |
+| `networking_provisioning_enabled` | `EXTRA_VARS='{"networking_provisioning_enabled": false}'` | Set the installation-time shared provider-networking provisioning flag (default: `true`). Fulfillment saves it on first startup; changing it requires reinstalling with a fresh Fulfillment database. |
 | `fulfillment_service_image` | `EXTRA_VARS="fulfillment_service_image=quay.io/osac/fulfillment-service:pr-123"` | Override a component image for a build under test. |
 
 For example, combine common options in one `EXTRA_VARS` value:

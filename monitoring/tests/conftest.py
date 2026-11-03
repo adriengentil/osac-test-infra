@@ -39,6 +39,11 @@ def digest():
     return _load("post_ci_digest", "post-ci-digest.py")
 
 
+@pytest.fixture(scope="session")
+def trends():
+    return _load("ci_observe_trends", "ci_observe_trends.py")
+
+
 @pytest.fixture
 def github(wfe, monkeypatch):
     fake = FakeGitHub(wfe.API_URL)
@@ -56,3 +61,13 @@ def exporter(wfe, github, tmp_path, monkeypatch):
     monkeypatch.setattr(wfe, "TOKEN", None)
     monkeypatch.setattr(wfe, "REPOS_FILTER", [])
     return wfe.WorkflowExporter()
+
+
+@pytest.fixture
+def evidence(wfe, exporter, monkeypatch):
+    """The exporter with a token set, so the /api/ci-observe/run native
+    lookup runs against the fake GitHub API (nothing leaves the test)."""
+    token = "secret-token-do-not-leak"
+    monkeypatch.setattr(wfe, "TOKEN", token)
+    exporter.headers = {"Authorization": f"token {token}"}
+    return exporter
