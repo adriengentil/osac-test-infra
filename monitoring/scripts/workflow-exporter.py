@@ -22,6 +22,7 @@ from datetime import datetime, timezone, timedelta
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from typing import ClassVar
 from urllib.parse import urlparse, parse_qs
+import urllib.parse
 
 import requests
 from prometheus_client import (
@@ -39,6 +40,7 @@ from prometheus_client import (
 # this directory on sys.path the way a package import would, so the
 # directory is added here before importing the sibling.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from ci_observe_capture_view import CIObserveCaptureView
 from ci_observe_run_evidence import CIObserveRunEvidence
 from ci_observe_runs import CIObserveRuns
 
@@ -52,6 +54,24 @@ logger = logging.getLogger(__name__)
 # Configuration
 # ---------------------------------------------------------------------------
 ORG = os.getenv("GITHUB_ORG", "osac-project")
+
+
+def epoch_ms(value):
+    """Unix milliseconds for an ISO timestamp, or None.
+
+    Grafana data links are rendered with this: its URL parser takes epoch
+    milliseconds everywhere, while a 20-character `...Z` string is not one
+    of the formats it accepts, so the range is silently ignored.
+    """
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return int(parsed.timestamp() * 1000)
 TOKEN = os.getenv("PRIVATE_GITHUB_TOKEN")
 API_URL = os.getenv("API_URL", "https://api.github.com")
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "90"))
@@ -80,8 +100,10 @@ REPOS_FILTER = [r.strip() for r in os.getenv("REPOS", "").split(",") if r.strip(
 # select "last 7 days" (see OSAC-2211).
 JOBS_HISTORY_DAYS = int(os.getenv("JOBS_HISTORY_DAYS", "60"))
 # Hard cap on stored job count regardless of age, as a memory/disk safety
-# net -- not expected to be the binding constraint at normal CI volume.
-JOBS_HISTORY_MAX_COUNT = int(os.getenv("JOBS_HISTORY_MAX_COUNT", "100000"))
+# net. It must not be the binding constraint before the 60-day retention:
+# ~5k jobs/day at current CI volume is ~300k jobs in 60 days, and the old
+# 100k cap silently cut a 60-day page to about 20 days.
+JOBS_HISTORY_MAX_COUNT = int(os.getenv("JOBS_HISTORY_MAX_COUNT", "400000"))
 # Data directory for the SQLite DB (persists across restarts) and the
 # legacy JSON cache file this exporter migrates from on first startup.
 CACHE_DIR = os.getenv("CACHE_DIR", os.path.expanduser("~/.monitoring-server/data"))
@@ -94,6 +116,7 @@ JOB_COLUMNS = [
     "conclusion", "event", "trigger", "duration_s", "duration", "actor",
     "url", "created_at", "updated_at", "run_number", "run_attempt",
     "failed_step", "steps_json", "failure_reason", "runner_name", "head_sha",
+    "run_id",
 ]
 
 # ---------------------------------------------------------------------------
@@ -160,6 +183,684 @@ api_remaining = Gauge(
     "GitHub API rate limit remaining (workflow exporter)",
     ["org"],
 )
+
+
+# ---------------------------------------------------------------------------
+# Capture registry
+# ---------------------------------------------------------------------------
+class CaptureRegistry:
+    """The capture set in workflow-exporter.db, refreshed by a 60-second poll.
+
+    The set is the union of three answers: the Prometheus label values of
+    `osac_ci_capture_id` (15-day retention), the Loki label values of the same
+    label (30-day query cap), and the `osac_ci_capture_info` metric, which
+    carries the identity fields. Tempo is never queried for discovery; its
+    tag-values scan took 21-29s for 7 days against 17ms for Prometheus.
+
+    `captures` is the only table the request path reads. An upsert never
+    empties a known field: a source that only knows the capture id cannot
+    erase an identity another source already wrote. No row is deleted before
+    PRUNE_DAYS.
+
+    `capture_source` records, per source, how far back its coverage reaches
+    and when it last answered completely. `coverage_from` is written once, on
+    the first complete answer, and never moves; `last_ok_at` moves only on a
+    complete answer, so a failed poll cannot extend the window in which a
+    missing capture is judged as "not collected".
+    """
+
+    PROMETHEUS_RETENTION_DAYS = 15
+    LOKI_RETENTION_DAYS = 30
+    INFO_RETENTION_DAYS = 15
+    PRUNE_DAYS = 90
+    # A registry that has not answered for this long is stale. The verdict
+    # then says unknown, never not collected: telemetry may have arrived
+    # while the poller was down.
+    STALE_SECONDS = 900
+    POLL_SECONDS = int(os.getenv("CAPTURE_POLL_INTERVAL", "60"))
+    HTTP_TIMEOUT_SECONDS = 10
+    MAX_LIMIT = 2000
+    MAX_REJECTED_NAMES = 50
+
+    METRICS_URL_ENV = "CI_OBSERVE_METRICS_URL"
+    LOKI_URL_ENV = "CI_OBSERVE_LOKI_URL"
+    DEFAULT_METRICS_URL = "http://127.0.0.1:9092"
+    DEFAULT_LOKI_URL = "http://127.0.0.1:3100"
+    CAPTURE_LABEL = "osac_ci_capture_id"
+    INFO_METRIC = "osac_ci_capture_info"
+
+    SOURCES = ("prometheus", "loki", "info")
+
+    # The persisted identity fields, in table order. The info metric's
+    # datapoint attributes carry them; a parsed capture id carries run_id,
+    # run_attempt and suite only.
+    IDENTITY_COLUMNS = (
+        "run_id", "run_attempt", "suite", "pr", "workflow", "test_ref",
+        "test_sha", "test_infra_ref", "test_infra_sha",
+        "test_infra_workflow_sha", "test_suite", "test_filter", "test_marker",
+    )
+    # Metric label -> column for the info metric's datapoint attributes.
+    INFO_LABELS = {
+        "ci_run_id": "run_id",
+        "ci_run_attempt": "run_attempt",
+        "ci_suite": "suite",
+        "ci_pr": "pr",
+        "ci_workflow": "workflow",
+        "ci_test_ref": "test_ref",
+        "ci_test_sha": "test_sha",
+        "ci_test_infra_ref": "test_infra_ref",
+        "ci_test_infra_sha": "test_infra_sha",
+        "ci_test_infra_workflow_sha": "test_infra_workflow_sha",
+        "ci_test_suite": "test_suite",
+        "ci_test_filter": "test_filter",
+        "ci_test_marker": "test_marker",
+    }
+    # The identity a cohort groups on: the suite plus the five refs/SHAs that
+    # say which code and harness ran. Empty or "unknown" in any field keeps a
+    # capture out of the cohorts list, never in a cohort called unknown.
+    # The six fields an exact cohort groups on. test_ref is metadata: the
+    # same commit can be named `main` and a tag name.
+    COHORT_FIELDS = (
+        "test_sha", "test_infra_sha", "test_infra_workflow_sha",
+        "test_suite", "test_filter", "test_marker",
+    )
+    # A cohort needs all six identity fields. The action records "none" for
+    # no filter or marker and "unknown" for an unrecorded suite, so an empty
+    # value means the label never arrived. The Compare span queries require
+    # each of these to be non-empty, so an empty one would key a cohort whose
+    # tables can never return a row.
+    COHORT_REQUIRED_FIELDS = COHORT_FIELDS
+
+    def __init__(self, exporter):
+        self.exporter = exporter
+        self.metrics_url = (
+            os.getenv(self.METRICS_URL_ENV) or self.DEFAULT_METRICS_URL
+        ).rstrip("/")
+        self.loki_url = (
+            os.getenv(self.LOKI_URL_ENV) or self.DEFAULT_LOKI_URL
+        ).rstrip("/")
+        # The junk ids seen by the latest poll, as {source: [id, ...]}. Named
+        # in the response so a format change is visible, not silently
+        # dropped.
+        self.rejected = {}
+
+    # -- schema ------------------------------------------------------------
+    def ensure_schema(self, conn):
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS captures (
+                capture_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL DEFAULT '',
+                run_attempt TEXT NOT NULL DEFAULT '',
+                suite TEXT NOT NULL DEFAULT '',
+                pr TEXT NOT NULL DEFAULT '',
+                workflow TEXT NOT NULL DEFAULT '',
+                test_ref TEXT NOT NULL DEFAULT '',
+                test_sha TEXT NOT NULL DEFAULT '',
+                test_infra_ref TEXT NOT NULL DEFAULT '',
+                test_infra_sha TEXT NOT NULL DEFAULT '',
+                test_infra_workflow_sha TEXT NOT NULL DEFAULT '',
+                test_suite TEXT NOT NULL DEFAULT '',
+                test_filter TEXT NOT NULL DEFAULT '',
+                test_marker TEXT NOT NULL DEFAULT '',
+                session_trace_id TEXT NOT NULL DEFAULT '',
+                identity_source TEXT NOT NULL DEFAULT 'none',
+                capture_started_at TEXT,
+                first_seen_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_captures_run ON captures(run_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_captures_seen ON captures(first_seen_at)")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS capture_source (
+                source TEXT PRIMARY KEY,
+                coverage_from TEXT NOT NULL,
+                last_ok_at TEXT,
+                last_ok_count INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT NOT NULL DEFAULT '',
+                last_error_at TEXT
+            )
+        """)
+
+    # -- the poll ----------------------------------------------------------
+    def refresh(self, now=None):
+        """Union the three sources, upsert the captures, prune old rows.
+
+        Never raises: one source failing is recorded in capture_source and
+        leaves its last good answer in place. Returns the source summary.
+        """
+        now = now or datetime.now(timezone.utc)
+        found = {}
+        rejected = {}
+        for source, fetch in (
+            ("prometheus", self._prometheus_captures),
+            ("loki", self._loki_captures),
+            ("info", self._info_captures),
+        ):
+            try:
+                captures, junk = fetch(now)
+            except Exception as exc:
+                logger.warning("Capture discovery from %s failed: %s", source, exc)
+                self._record_failure(source, exc, now)
+                continue
+            rejected[source] = junk
+            self._record_success(source, len(captures), now)
+            for capture in captures:
+                entry = found.setdefault(capture["capture_id"], self._empty_capture(capture["capture_id"]))
+                # An identity-carrying answer wins over an id-only one, and
+                # never fills a field with an empty value.
+                if capture["identity_source"] == "info":
+                    entry["identity_source"] = "info"
+                for column in self.IDENTITY_COLUMNS:
+                    value = capture.get(column)
+                    if value:
+                        entry[column] = value
+        self.rejected = rejected
+        if found:
+            self._upsert_captures(list(found.values()), now)
+        self._prune(now)
+        return self.source_summary(now)
+
+    def poll_forever(self):
+        while True:
+            try:
+                self.refresh()
+            except Exception:
+                logger.exception("Capture registry poll failed")
+            time.sleep(self.POLL_SECONDS)
+
+    @staticmethod
+    def _empty_capture(capture_id):
+        capture = {"capture_id": capture_id, "identity_source": "none", "capture_started_at": None}
+        for column in CaptureRegistry.IDENTITY_COLUMNS:
+            capture[column] = ""
+        return capture
+
+    # -- source readers ----------------------------------------------------
+    def _prometheus_captures(self, now):
+        start = now - timedelta(days=self.PROMETHEUS_RETENTION_DAYS)
+        query = urllib.parse.urlencode({
+            "start": start.timestamp(), "end": now.timestamp(),
+        })
+        url = f"{self.metrics_url}/api/v1/label/{self.CAPTURE_LABEL}/values?{query}"
+        values = self._get_json(url)
+        if not isinstance(values, list):
+            raise ValueError("the label-values response has no data list")
+        return self._captures_from_values(values)
+
+    def _loki_captures(self, now):
+        start = now - timedelta(days=self.LOKI_RETENTION_DAYS)
+        query = urllib.parse.urlencode({
+            "start": int(start.timestamp() * 1_000_000_000),
+            "end": int(now.timestamp() * 1_000_000_000),
+        })
+        url = f"{self.loki_url}/loki/api/v1/label/{self.CAPTURE_LABEL}/values?{query}"
+        values = self._get_json(url)
+        if not isinstance(values, list):
+            raise ValueError("the label-values response has no data list")
+        return self._captures_from_values(values)
+
+    def _info_captures(self, now):
+        metric = f"last_over_time({self.INFO_METRIC}[{self.INFO_RETENTION_DAYS}d])"
+        query = urllib.parse.urlencode({"query": metric, "time": now.timestamp()})
+        data = self._get_json(f"{self.metrics_url}/api/v1/query?{query}")
+        series = data.get("result") if isinstance(data, dict) else None
+        if not isinstance(series, list):
+            raise ValueError("the query response has no result list")
+        captures = {}
+        junk = []
+        for item in series:
+            labels = item.get("metric") if isinstance(item, dict) else None
+            labels = labels if isinstance(labels, dict) else {}
+            capture_id = (
+                labels.get(self.CAPTURE_LABEL)
+                or labels.get("capture_id")
+                or labels.get("ci_capture_id")
+                or ""
+            )
+            parsed = self.parse_capture_id(capture_id)
+            if not parsed:
+                junk.append(capture_id or "<empty>")
+                continue
+            capture = self._empty_capture(capture_id)
+            capture["identity_source"] = "info"
+            capture.update(parsed)
+            for label, column in self.INFO_LABELS.items():
+                value = labels.get(label)
+                if value:
+                    capture[column] = str(value)
+            # A capture can have one series per verify post; keep the answer
+            # with the most fields rather than letting the last one win.
+            known = captures.get(capture_id)
+            if known is None or self._known_fields(capture) > self._known_fields(known):
+                captures[capture_id] = capture
+        return list(captures.values()), junk
+
+    def _captures_from_values(self, values):
+        captures = []
+        junk = []
+        for value in values:
+            if not isinstance(value, str):
+                continue
+            parsed = self.parse_capture_id(value)
+            if not parsed:
+                junk.append(value)
+                continue
+            capture = self._empty_capture(value)
+            capture.update(parsed)
+            captures.append(capture)
+        return captures, junk
+
+    @staticmethod
+    def _known_fields(capture):
+        return sum(1 for column in CaptureRegistry.IDENTITY_COLUMNS if capture.get(column))
+
+    @staticmethod
+    def parse_capture_id(capture_id):
+        """{"run_id", "run_attempt", "suite"} or None for a junk id.
+
+        The current form is "<suite>-<prN|main>-<run id>-a<attempt>"; the
+        legacy form is "run-<run id>-attempt-<attempt>". A bare run id is not
+        a capture id and is reported as junk.
+        """
+        cid = (capture_id or "").strip()
+        match = CIObserveRunEvidence.CAPTURE_ID_RE.match(cid)
+        if match:
+            suite = re.sub(r"-(?:pr\d+|main)-\d+-a\d+$", "", cid)
+            return {"run_id": match.group(1), "run_attempt": match.group(2), "suite": suite}
+        legacy = CIObserveRunEvidence.LEGACY_CAPTURE_ID_RE.match(cid)
+        if legacy:
+            return {"run_id": legacy.group(1), "run_attempt": legacy.group(2), "suite": ""}
+        return None
+
+    def _get_json(self, url):
+        response = requests.get(url, timeout=self.HTTP_TIMEOUT_SECONDS)
+        if not response.ok:
+            raise ValueError(f"HTTP {response.status_code}: {(response.text or '')[:200]}")
+        document = response.json()
+        if not isinstance(document, dict) or document.get("status") != "success":
+            raise ValueError("the response is not a successful query result")
+        return document.get("data")
+
+    # -- persistence -------------------------------------------------------
+    def _upsert_captures(self, captures, now):
+        stamp = self._iso(now)
+        identity = ",\n                ".join(
+            f"{column} = CASE WHEN excluded.{column} != '' "
+            f"THEN excluded.{column} ELSE captures.{column} END"
+            for column in self.IDENTITY_COLUMNS
+        )
+        sql = f"""
+            INSERT INTO captures (
+                capture_id, {", ".join(self.IDENTITY_COLUMNS)},
+                session_trace_id, identity_source, capture_started_at,
+                first_seen_at, last_seen_at
+            ) VALUES (
+                :capture_id, {", ".join(":" + c for c in self.IDENTITY_COLUMNS)},
+                '', :identity_source, :capture_started_at, :first_seen_at, :last_seen_at
+            )
+            ON CONFLICT(capture_id) DO UPDATE SET
+                {identity},
+                identity_source = CASE WHEN excluded.identity_source = 'info'
+                    THEN 'info' ELSE captures.identity_source END,
+                capture_started_at = COALESCE(excluded.capture_started_at, captures.capture_started_at),
+                last_seen_at = excluded.last_seen_at
+        """
+        rows = []
+        for capture in captures:
+            row = {column: capture.get(column) or "" for column in self.IDENTITY_COLUMNS}
+            row.update(
+                capture_id=capture["capture_id"],
+                identity_source=capture.get("identity_source") or "none",
+                capture_started_at=capture.get("capture_started_at"),
+                first_seen_at=stamp,
+                last_seen_at=stamp,
+            )
+            rows.append(row)
+        with self.exporter._db() as conn:
+            conn.executemany(sql, rows)
+
+    def _record_success(self, source, count, now):
+        retention = {
+            "prometheus": self.PROMETHEUS_RETENTION_DAYS,
+            "loki": self.LOKI_RETENTION_DAYS,
+            "info": self.INFO_RETENTION_DAYS,
+        }[source]
+        # coverage_from is now - retention + one day: a run older than that
+        # may have lost its telemetry to retention, so its absence proves
+        # nothing. Written on the first complete answer and never moved.
+        coverage_from = self._iso(now - timedelta(days=retention - 1))
+        with self.exporter._db() as conn:
+            conn.execute(
+                """
+                INSERT INTO capture_source
+                    (source, coverage_from, last_ok_at, last_ok_count, last_error)
+                VALUES (:source, :coverage_from, :now, :count, '')
+                ON CONFLICT(source) DO UPDATE SET
+                    coverage_from = CASE WHEN capture_source.coverage_from = ''
+                        THEN :coverage_from ELSE capture_source.coverage_from END,
+                    last_ok_at = :now,
+                    last_ok_count = :count,
+                    last_error = ''
+                """,
+                {
+                    "source": source, "coverage_from": coverage_from,
+                    "now": self._iso(now), "count": count,
+                },
+            )
+
+    def _record_failure(self, source, exc, now):
+        message = str(exc)[:300] or exc.__class__.__name__
+        with self.exporter._db() as conn:
+            conn.execute(
+                """
+                INSERT INTO capture_source
+                    (source, coverage_from, last_ok_at, last_ok_count, last_error, last_error_at)
+                VALUES (:source, '', NULL, 0, :error, :now)
+                ON CONFLICT(source) DO UPDATE SET
+                    last_error = :error,
+                    last_error_at = :now
+                """,
+                {"source": source, "error": message, "now": self._iso(now)},
+            )
+
+    def _prune(self, now):
+        cutoff = self._iso(now - timedelta(days=self.PRUNE_DAYS))
+        with self.exporter._db() as conn:
+            conn.execute("DELETE FROM captures WHERE last_seen_at < ?", (cutoff,))
+
+    @staticmethod
+    def _iso(value):
+        return value.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    @staticmethod
+    def _parse_iso(value):
+        if not value:
+            return None
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+    # -- request path ------------------------------------------------------
+    def source_summary(self, now=None):
+        """The `source` block of /api/ci-observe/runs.
+
+        Aggregated conservatively across the three sources: a run is inside
+        coverage only if it is inside every source's, and judgeable only if
+        every source answered after it finished. `state` is ok, partial or
+        unknown.
+        """
+        now = now or datetime.now(timezone.utc)
+        with self.exporter._db() as conn:
+            rows = {
+                row["source"]: dict(row)
+                for row in conn.execute("SELECT * FROM capture_source")
+            }
+            total = conn.execute("SELECT COUNT(*) FROM captures").fetchone()[0]
+        sources = []
+        last_oks = []
+        coverage_froms = []
+        for name in self.SOURCES:
+            row = rows.get(name) or {
+                "source": name, "coverage_from": "", "last_ok_at": None,
+                "last_ok_count": 0, "last_error": "", "last_error_at": None,
+            }
+            last_ok = self._parse_iso(row["last_ok_at"])
+            coverage_from = self._parse_iso(row["coverage_from"])
+            last_oks.append(last_ok)
+            coverage_froms.append(coverage_from)
+            sources.append({
+                "source": name,
+                "coverage_from": row["coverage_from"] or "",
+                "last_ok_at": row["last_ok_at"] or "",
+                "last_ok_count": row["last_ok_count"] or 0,
+                "last_error": row["last_error"] or "",
+                "last_error_at": row["last_error_at"] or "",
+                "fresh": bool(last_ok and (now - last_ok).total_seconds() <= self.STALE_SECONDS),
+            })
+        answered = [value for value in last_oks if value is not None]
+        if not answered:
+            state = "unknown"
+        elif len(answered) < len(self.SOURCES):
+            state = "partial"
+        elif all(now - value <= timedelta(seconds=self.STALE_SECONDS) for value in answered):
+            state = "ok"
+        else:
+            state = "partial"
+        rejected = []
+        for values in self.rejected.values():
+            rejected.extend(values)
+        rejected = sorted(set(rejected))
+        last_ok_at = min(answered) if answered else None
+        coverage_from = max(coverage_froms) if answered and all(coverage_froms) else None
+        return {
+            "state": state,
+            "last_ok_at": self._iso(last_ok_at) if last_ok_at else "",
+            "coverage_from": self._iso(coverage_from) if coverage_from else "",
+            "captures": total,
+            "rejected": {
+                "count": len(rejected),
+                "ids": rejected[: self.MAX_REJECTED_NAMES],
+            },
+            "sources": sources,
+        }
+
+    def capture_ids_by_run(self, days=7, now=None):
+        """{run id: [capture id, ...]} from SQLite. The Pull requests page
+        reads this, so it never pays a Tempo query for a capture link."""
+        now = now or datetime.now(timezone.utc)
+        since = self._iso(now - timedelta(days=days))
+        with self.exporter._db() as conn:
+            rows = conn.execute(
+                "SELECT run_id, capture_id FROM captures "
+                "WHERE run_id != '' AND last_seen_at >= ? ORDER BY run_id, capture_id",
+                (since,),
+            ).fetchall()
+        captures = {}
+        for row in rows:
+            captures.setdefault(row["run_id"], []).append(row["capture_id"])
+        return captures
+
+    def captures_json(self, params):
+        """GET /api/ci-observe/captures: registry rows, newest seen first."""
+        now = datetime.now(timezone.utc)
+        days, limit = self._window(params), self._limit(params)
+        window_from = self._iso(now - timedelta(days=days))
+        # An explicit but empty lookup is the Find box with nothing typed. It
+        # must answer "no rows", not every capture in the window.
+        blank_lookup = [
+            name
+            for name in ("capture_id", "run_id", "suite")
+            if name in params and not (params[name][0] or "").strip()
+        ]
+        if blank_lookup:
+            return {
+                "days": days,
+                "window_from": window_from,
+                "window_to": self._iso(now),
+                "captures": [],
+                "truncated": False,
+                "counts": {"returned": 0, "matched": 0},
+                "notes": [
+                    f"the {name} lookup is empty; enter a value, or clear it to list every capture"
+                    for name in blank_lookup
+                ],
+            }
+        where = ["last_seen_at >= :since"]
+        args = {"since": window_from, "fetch": limit + 1}
+        for name, column in (
+            ("capture_id", "capture_id"),
+            ("run_id", "run_id"),
+            ("suite", "suite"),
+        ):
+            value = (params.get(name, [""])[0] or "").strip()
+            if value:
+                where.append(f"{column} = :{name}")
+                args[name] = value
+        sql = (
+            "SELECT capture_id, run_id, run_attempt, suite, pr, workflow, "
+            "test_ref, test_sha, test_infra_ref, test_infra_sha, "
+            "test_infra_workflow_sha, test_suite, test_filter, test_marker, "
+            "session_trace_id, identity_source, capture_started_at, "
+            "first_seen_at, last_seen_at, "
+            "COALESCE(capture_started_at, "
+            "strftime('%Y-%m-%dT%H:%M:%SZ', first_seen_at, '-2 hours')) AS capture_window_from, "
+            "last_seen_at AS capture_window_to, "
+            "COUNT(*) OVER () AS matched "
+            "FROM captures WHERE " + " AND ".join(where) +
+            " ORDER BY last_seen_at DESC, capture_id LIMIT :fetch"
+        )
+        with self.exporter._db() as conn:
+            rows = [dict(row) for row in conn.execute(sql, args)]
+        matched = rows[0]["matched"] if rows else 0
+        truncated = len(rows) > limit
+        for row in rows[:limit]:
+            row.pop("matched", None)
+            row["capture_window_from_ms"] = epoch_ms(row["capture_window_from"])
+            row["capture_window_to_ms"] = epoch_ms(row["capture_window_to"])
+        return {
+            "days": days,
+            "window_from": window_from,
+            "window_to": self._iso(now),
+            "captures": rows[:limit],
+            "truncated": truncated,
+            "counts": {"returned": min(len(rows), limit), "matched": matched},
+            "notes": [],
+        }
+
+    def cohorts_json(self, params):
+        """GET /api/ci-observe/cohorts: exact cohorts plus the ungrouped rows.
+
+        A cohort is one exact combination of the six identity fields, and
+        only rows with identity_source=info and all six fields present and
+        not `unknown` take part. An empty field means the info metric never
+        carried it, and the Compare span queries would never match it. Everything else is listed under `ungrouped`; "unknown" is never
+        used as a cohort value. The requested ref is metadata: the same
+        commit can be named `main` and a tag, and that must not split a
+        cohort.
+        """
+        now = datetime.now(timezone.utc)
+        days, limit = self._window(params), self._limit(params)
+        window_from = self._iso(now - timedelta(days=days))
+        fields = self.COHORT_FIELDS
+        complete = " AND ".join(
+            f"LOWER(COALESCE({field}, '')) NOT IN ('', 'unknown')"
+            for field in self.COHORT_REQUIRED_FIELDS
+        )
+        group_by = ", ".join(fields)
+        args = {"since": window_from, "fetch": limit + 1, "ungrouped_fetch": limit + 1}
+        with self.exporter._db() as conn:
+            cohorts = [dict(row) for row in conn.execute(
+                f"""
+                SELECT {group_by}, MIN(test_ref) AS test_ref,
+                       GROUP_CONCAT(DISTINCT test_ref) AS test_refs,
+                       COUNT(*) AS captures,
+                       MIN(first_seen_at) AS first_seen_at,
+                       MAX(last_seen_at) AS last_seen_at,
+                       GROUP_CONCAT(capture_id) AS capture_ids,
+                       COUNT(*) OVER () AS matched
+                FROM captures
+                WHERE last_seen_at >= :since
+                  AND identity_source = 'info'
+                  AND {complete}
+                GROUP BY {group_by}
+                ORDER BY last_seen_at DESC, {group_by}
+                LIMIT :fetch
+                """,
+                args,
+            )]
+            ungrouped = [dict(row) for row in conn.execute(
+                f"""
+                SELECT capture_id, run_id, run_attempt, suite, pr, workflow,
+                       test_ref, test_sha, test_infra_ref, test_infra_sha,
+                       test_infra_workflow_sha, test_suite, test_filter,
+                       test_marker, identity_source, capture_started_at,
+                       first_seen_at, last_seen_at,
+                       -- A row without an info-metric start time still needs
+                       -- a window that contains the capture: it was first
+                       -- seen within a poll interval of starting, so two
+                       -- hours back is a safe lower bound.
+                       COALESCE(
+                           capture_started_at,
+                           strftime('%Y-%m-%dT%H:%M:%SZ', first_seen_at, '-2 hours')
+                       ) AS capture_window_from,
+                       last_seen_at AS capture_window_to
+                FROM captures
+                WHERE last_seen_at >= :since
+                  AND (identity_source != 'info' OR NOT ({complete}))
+                ORDER BY last_seen_at DESC, capture_id
+                LIMIT :ungrouped_fetch
+                """,
+                args,
+            )]
+        matched = cohorts[0]["matched"] if cohorts else 0
+        truncated = len(cohorts) > limit or len(ungrouped) > limit
+        for row in cohorts[:limit]:
+            row["capture_ids"] = sorted((row.get("capture_ids") or "").split(","))
+            row.pop("matched", None)
+        ungrouped = [
+            row
+            | {
+                "reason": self._ungrouped_reason(row),
+                "capture_window_from_ms": epoch_ms(row["capture_window_from"]),
+                "capture_window_to_ms": epoch_ms(row["capture_window_to"]),
+            }
+            for row in ungrouped[:limit]
+        ]
+        notes = []
+        if truncated:
+            notes.append(
+                f"the row limit ({limit}) was reached; narrow the window to see "
+                "every cohort and ungrouped capture"
+            )
+        return {
+            "days": days,
+            "window_from": window_from,
+            "window_to": self._iso(now),
+            "group_by": list(fields),
+            "cohorts": cohorts[:limit],
+            "ungrouped": ungrouped,
+            "truncated": truncated,
+            "counts": {
+                "cohorts": min(len(cohorts), limit),
+                "cohorts_matched": matched,
+                "ungrouped": min(len(ungrouped), limit),
+            },
+            "source": self.source_summary(now),
+            "notes": notes,
+        }
+
+    def _ungrouped_reason(self, row):
+        """Why a capture is not in a cohort, in plain words."""
+        if row.get("identity_source") != "info":
+            return "no identity from the info metric"
+        missing = [
+            field for field in self.COHORT_REQUIRED_FIELDS
+            if not (row.get(field) or "").strip()
+        ]
+        if missing:
+            return "missing identity: " + ", ".join(missing)
+        unknown = [
+            field for field in self.COHORT_FIELDS
+            if (row.get(field) or "").strip().lower() == "unknown"
+        ]
+        return "unknown identity: " + ", ".join(unknown)
+
+    def _window(self, params):
+        return self._int_param(params, "days", 7, 1, 60)
+
+    def _limit(self, params):
+        return self._int_param(params, "limit", 200, 1, self.MAX_LIMIT)
+
+    @staticmethod
+    def _int_param(params, name, default, low, high):
+        try:
+            value = int(params.get(name, [""])[0] or default)
+        except (TypeError, ValueError):
+            value = default
+        return max(low, min(value, high))
 
 
 # ---------------------------------------------------------------------------
@@ -611,11 +1312,19 @@ class WorkflowExporter:
         # cached. It holds this exporter as the shared DB, GitHub API and
         # headers -- no second poller, no new artifact.
         self._run_evidence = CIObserveRunEvidence(self)
+        # The capture registry: the union of Prometheus, Loki and the info
+        # metric, polled every 60 seconds into workflow-exporter.db. The
+        # request path only ever reads this table (see CaptureRegistry).
+        self._captures = CaptureRegistry(self)
         # The E2E run list with its capture verdict, for /api/ci-observe/runs
         # (see get_ci_observe_runs_json and ci_observe_runs.py). It reads the
-        # job history above and joins it to Tempo's capture ids on the run id,
-        # with a 60-second capture-map cache. No new poller, no new store.
+        # job history and the capture registry above, both SQLite; Tempo is
+        # never called.
         self._runs = CIObserveRuns(self)
+        # The Capture document: one session trace fetched by id and classified
+        # (see ci_observe_capture_view.py). Cached and single-flighted; the
+        # Capture dashboard is the only reader.
+        self._capture_view = CIObserveCaptureView(self)
         self._init_db()
 
     # -- SQLite persistence ---------------------------------------------------
@@ -654,9 +1363,12 @@ class WorkflowExporter:
             # schema, so a DB from before pr_url/pr_display existed needs
             # an explicit migration.
             existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(jobs)")}
-            for col in ("pr_url", "pr_display", "failure_reason", "runner_name", "head_sha"):
+            for col in ("pr_url", "pr_display", "failure_reason", "runner_name", "head_sha", "run_id"):
                 if col not in existing_cols:
                     conn.execute(f"ALTER TABLE jobs ADD COLUMN {col} TEXT DEFAULT ''")
+            # The run index joins captures to jobs on the GitHub run id. The
+            # index keeps that lookup one statement over run-level rows.
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_run ON jobs(run_id)")
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS pr_merges (
                     id INTEGER PRIMARY KEY,
@@ -681,6 +1393,10 @@ class WorkflowExporter:
                         "approval_to_queue_seconds", "via_merge_queue"):
                 if col not in pr_merges_cols:
                     conn.execute(f"ALTER TABLE pr_merges ADD COLUMN {col} INTEGER")
+            # The capture registry the request path reads (see
+            # CaptureRegistry): captures and the per-source coverage rows.
+            self._captures.ensure_schema(conn)
+        self._backfill_job_run_ids_if_needed()
         self._migrate_json_cache_if_needed()
         self._backfill_pr_data_from_legacy_cache()
         self._backfill_pr_approval_data_if_needed()
@@ -1042,6 +1758,10 @@ class WorkflowExporter:
         """
         row = {c: record.get(c) for c in JOB_COLUMNS if c != "steps_json"}
         row["id"] = record.get("id")
+        # A suite row carries its parent run's id in record["run_id"]; a
+        # run-level row is its own run. Stored as TEXT because a capture id
+        # embeds the run id as text.
+        row["run_id"] = str(record.get("run_id") or record.get("id") or "")
         row["steps_json"] = json.dumps(record.get("steps", []))
         placeholders = ", ".join(f":{c}" for c in JOB_COLUMNS)
         update_clause = ", ".join(
@@ -1065,6 +1785,44 @@ class WorkflowExporter:
             for suite in self._suite_records(record, jobs):
                 self._upsert_job(suite)
         return stored
+
+    def _backfill_job_run_ids_if_needed(self):
+        """Fill jobs.run_id from the run URL for rows stored before the
+        column existed.
+
+        The URL carries the run id: ".../actions/runs/<run id>" for a
+        run-level row and ".../actions/runs/<run id>/job/<job id>" for a
+        suite row. Idempotent: rows that already have a run_id are skipped,
+        and a URL that does not match stays empty rather than guessing.
+        """
+        with self._db() as conn:
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(jobs)")}
+            if not {"url", "run_id"} <= columns:
+                # A very old schema (the migration test's table) has neither
+                # the URL nor the column; there is nothing to backfill.
+                return
+            rows = conn.execute(
+                "SELECT id, url FROM jobs WHERE COALESCE(run_id, '') = ''"
+            ).fetchall()
+            updates = []
+            for row in rows:
+                match = re.search(r"/actions/runs/(\d+)", row["url"] or "")
+                if match:
+                    updates.append((match.group(1), row["id"]))
+            if updates:
+                conn.executemany("UPDATE jobs SET run_id = ? WHERE id = ?", updates)
+        if updates:
+            logger.info("Backfilled run_id on %d stored job row(s)", len(updates))
+
+    def start_capture_poll(self):
+        """Start the 60-second capture registry poll on a daemon thread.
+
+        Only main() calls this: constructing an exporter (as the tests and
+        the one-off backfill do) must not start a poller.
+        """
+        thread = threading.Thread(target=self._captures.poll_forever, daemon=True)
+        thread.start()
+        return thread
 
     def _prune_jobs(self):
         """Evict jobs older than JOBS_HISTORY_DAYS, then enforce the hard
@@ -1658,6 +2416,9 @@ class WorkflowExporter:
             # GitHub call. It joins a capture's spans (osac.ci.run_id) to the
             # source SHA without a live metadata fetch per query.
             "head_sha": run.get("head_sha", ""),
+            # The GitHub run id, indexed: the capture ids embed it and the
+            # ci-observe run index joins captures on it (idx_jobs_run).
+            "run_id": str(run.get("id", "")),
         }
 
     @staticmethod
@@ -3623,23 +4384,207 @@ class WorkflowExporter:
 
     # -- ci-observe runs (begin) --------------------------------------------
     #
-    # GET /api/ci-observe/runs?days=<n>&limit=<n> backs the entry page's
-    # "Recent E2E runs" table: one row per E2E run, with the per-run verdict
-    # the front door needs (capture, not collected, or unknown). The
-    # implementation lives in the sibling ci_observe_runs module
-    # (CIObserveRuns, held as self._runs). The run list is the exporter's own
-    # SQLite history and the capture ids come from one bounded, 60-second
-    # cached Tempo search, joined on the GitHub run id that the capture id
-    # embeds. Tempo being down, truncated or unreadable yields "unknown",
-    # never "not collected" -- see ci_observe_runs.py for the full rule.
+    # GET /api/ci-observe/runs?days=<n>&limit=<n>&before=<run id>&run=<run id>
+    # backs the entry page's "Recent E2E runs" table: one row per E2E run,
+    # with the per-run verdict the front door needs (capture, not collected,
+    # or unknown). The verdict lives in the sibling ci_observe_runs module
+    # (CIObserveRuns, held as self._runs); the SQL lives here, next to the
+    # schema it reads.
     #
-    # Query params: days -- days of runs to list (default 7, max 60),
-    # limit -- runs to list (default 200).
+    # The page is one statement over run-level job rows joined to the
+    # registry's captures on run_id, paged by run id (ids increase with
+    # creation time), with the total computed by a window function so no
+    # second count query is needed. No Tempo.
+    def _ci_observe_run_where(self, window_from, window_to, before="", run_id=""):
+        """The WHERE clause every run-level ci-observe query shares.
+
+        A full-install run has one e2e row whose id is the run id. A
+        pull-request-flow run (e2e-pr.yml, e2e-queue.yml) has one e2e row per
+        suite: its id is a job id and its run_id is the parent run. Both are
+        runs, and a capture id always names the parent run, so the index
+        groups by run_id and a run is visible either way. The gated runs are
+        not E2E.
+        """
+        where = [
+            "j.category = 'e2e'",
+            "j.run_id != ''",
+            "LOWER(j.workflow) NOT LIKE '%' || :gate_suffix",
+            "COALESCE(LOWER(j.failure_reason), '') != 'gate'",
+        ]
+        args = {"gate_suffix": self.GATE_NAME_SUFFIX}
+        if run_id:
+            # Stored run ids are canonical digit strings, so a text compare
+            # uses idx_jobs_run. A non-numeric id matches nothing instead of
+            # matching a neighbouring id through a cast.
+            args["run_id"] = str(int(run_id)) if str(run_id).isdigit() else "\x00"
+            where.append("j.run_id = :run_id")
+        else:
+            where.append("j.created_at >= :since")
+            where.append("j.created_at < :until")
+            args["since"] = self._iso_utc(window_from)
+            args["until"] = self._iso_utc(window_to)
+            if before:
+                # Keyset paging on the indexed text column. Run ids are
+                # fixed-length digit strings, so text order is numeric order.
+                where.append("j.run_id < :before")
+                args["before"] = str(int(before))
+        return " AND ".join(where), args
+
+    # A run can have several e2e rows, so every selected column states how it
+    # combines them. The conclusion follows GitHub: any failed row fails the
+    # run, a row still without one leaves it unfinished, and an all-cancelled
+    # run is cancelled.
+    CI_OBSERVE_RUN_CONCLUSION = (
+        "CASE"
+        " WHEN SUM(CASE WHEN LOWER(COALESCE(j.conclusion, ''))"
+        " IN ('failure', 'timed_out', 'startup_failure') THEN 1 ELSE 0 END) > 0"
+        " THEN 'failure'"
+        " WHEN SUM(CASE WHEN COALESCE(j.conclusion, '') = '' THEN 1 ELSE 0 END) > 0"
+        " THEN ''"
+        " WHEN SUM(CASE WHEN LOWER(COALESCE(j.conclusion, '')) = 'cancelled' THEN 1 ELSE 0 END) > 0"
+        " THEN 'cancelled'"
+        # action_required, neutral, stale or anything else keeps its own name
+        # instead of being reported as a success.
+        " WHEN SUM(CASE WHEN LOWER(j.conclusion) != 'success' THEN 1 ELSE 0 END) > 0"
+        " THEN MAX(CASE WHEN LOWER(j.conclusion) != 'success' THEN j.conclusion END)"
+        " ELSE 'success'"
+        " END"
+    )
+    CI_OBSERVE_RUN_STATUS = (
+        "CASE WHEN SUM(CASE WHEN LOWER(COALESCE(j.status, '')) != 'completed' THEN 1 ELSE 0 END) > 0"
+        " THEN MAX(CASE WHEN LOWER(COALESCE(j.status, '')) != 'completed' THEN j.status END)"
+        " ELSE 'completed' END"
+    )
+    CI_OBSERVE_RUN_WORKFLOW = (
+        "CASE WHEN COUNT(DISTINCT j.workflow) > 1"
+        " THEN GROUP_CONCAT(DISTINCT j.workflow)"
+        " ELSE MAX(j.workflow) END"
+    )
+    # The stored url of a suite row is its job page. Prefer the run-level
+    # row's url; otherwise build the run page from the repo and run id.
+    CI_OBSERVE_RUN_URL = (
+        "COALESCE("
+        " MAX(CASE WHEN CAST(j.id AS TEXT) = j.run_id THEN j.url END),"
+        " MAX(CASE WHEN j.repo != '' THEN"
+        " 'https://github.com/' || :org || '/' || j.repo || '/actions/runs/' || j.run_id END),"
+        " MAX(j.url)"
+        ")"
+    )
+
+    @staticmethod
+    def _iso_utc(value):
+        return value.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def get_ci_observe_run_window(self, days):
+        """Every run-level row in the window, one per run.
+
+        The entry page's verdict cards count the whole window, so they cannot
+        read a 200-row page. Same filter as get_ci_observe_run_page, no page
+        limit: about 7,400 rows for 60 days.
+        """
+        now = datetime.now(timezone.utc)
+        window_from = now - timedelta(days=days)
+        where, args = self._ci_observe_run_where(window_from, now)
+        sql = f"""
+            SELECT j.run_id AS id,
+                   {self.CI_OBSERVE_RUN_CONCLUSION} AS conclusion,
+                   {self.CI_OBSERVE_RUN_STATUS} AS status,
+                   MIN(j.created_at) AS created_at,
+                   MAX(j.updated_at) AS updated_at,
+                   GROUP_CONCAT(DISTINCT c.capture_id) AS capture_ids
+            FROM jobs j
+            LEFT JOIN captures c ON c.run_id = j.run_id
+            WHERE {where}
+            GROUP BY j.run_id
+            ORDER BY j.run_id DESC
+        """
+        with self._db() as conn:
+            rows = [dict(row) for row in conn.execute(sql, args)]
+        for row in rows:
+            row["id"] = str(row["id"])
+            row["capture_ids"] = sorted(
+                capture_id for capture_id in (row["capture_ids"] or "").split(",") if capture_id
+            )
+        return rows
+
+    def get_ci_observe_run_page(self, days, limit, before="", run_id=""):
+        """One page of run-level E2E rows, joined to their captures.
+
+        Returns rows, matched, truncated, window_from, window_to. `before` is
+        the id of the last run on the previous page: real keyset paging, so a
+        page neither repeats nor skips a run. `run_id` is an exact lookup and
+        ignores the window, so an old run still resolves.
+        """
+        now = datetime.now(timezone.utc)
+        window_from = now - timedelta(days=days)
+        where_sql, args = self._ci_observe_run_where(window_from, now, before, run_id)
+        args["fetch"] = limit + 1
+        args["org"] = ORG
+        sql = f"""
+            SELECT j.run_id AS id,
+                   j.run_id AS run_id,
+                   {self.CI_OBSERVE_RUN_WORKFLOW} AS workflow,
+                   MAX(j.trigger) AS trigger,
+                   MAX(j.branch) AS branch,
+                   {self.CI_OBSERVE_RUN_CONCLUSION} AS conclusion,
+                   {self.CI_OBSERVE_RUN_STATUS} AS status,
+                   MIN(j.created_at) AS created_at,
+                   MAX(j.updated_at) AS updated_at,
+                   {self.CI_OBSERVE_RUN_URL} AS url,
+                   COUNT(*) OVER () AS matched,
+                   GROUP_CONCAT(DISTINCT c.capture_id) AS capture_ids,
+                   MAX(CASE WHEN c.identity_source = 'info' THEN 1 ELSE 0 END) AS identity_info
+            FROM jobs j
+            LEFT JOIN captures c ON c.run_id = j.run_id
+            WHERE {where_sql}
+            GROUP BY j.run_id
+            ORDER BY j.run_id DESC
+            LIMIT :fetch
+        """
+        with self._db() as conn:
+            rows = [dict(row) for row in conn.execute(sql, args)]
+        matched = rows[0]["matched"] if rows else 0
+        truncated = len(rows) > limit
+        page = []
+        for row in rows[:limit]:
+            capture_ids = sorted(
+                capture_id for capture_id in (row.pop("capture_ids") or "").split(",") if capture_id
+            )
+            row.pop("matched", None)
+            page.append(
+                row | {
+                    "id": str(row["id"]),
+                    # A multi-suite run lists every suite. GROUP_CONCAT's
+                    # order is row order, which SQLite does not promise, so
+                    # sort it: the label must not change between requests.
+                    "workflow": ",".join(sorted(str(row["workflow"] or "").split(","))),
+                    "capture_ids": capture_ids,
+                    "identity_source": "info" if row.pop("identity_info") else "none",
+                }
+            )
+        return {
+            "rows": page,
+            "matched": matched,
+            "truncated": truncated,
+            "window_from": window_from.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "window_to": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+
     def get_ci_observe_runs_json(self, params):
         """The /api/ci-observe/runs document: runs, days, window_from,
-        window_to, tempo and notes. Thin wrapper over
+        window_to, source, truncated, counts and notes. Thin wrapper over
         CIObserveRuns.get_json, which also documents the response shape."""
         return self._runs.get_json(params)
+
+    def get_ci_observe_captures_json(self, params):
+        """GET /api/ci-observe/captures: the registry rows. Reads SQLite
+        only; the poller, not this request, talks to Prometheus and Loki."""
+        return self._captures.captures_json(params)
+
+    def get_ci_observe_cohorts_json(self, params):
+        """GET /api/ci-observe/cohorts: exact cohorts and the ungrouped
+        rows. Reads SQLite only."""
+        return self._captures.cohorts_json(params)
 
     # -- ci-observe runs (end) ----------------------------------------------
 
@@ -4025,13 +4970,58 @@ class ExporterHandler(BaseHTTPRequestHandler):
             self.wfile.write(payload.encode())
         # -- ci-observe trends (end) --
 
-        # GET /api/ci-observe/runs?days=<n>&limit=<n>  E2E runs + capture
-        # verdict (ci_observe_runs.py). Always 200: Tempo being unreachable
-        # is a data gap the table must show as "unknown", not an error the
-        # dashboard would render as an empty panel.
+        # GET /api/ci-observe/runs?days=<n>&limit=<n>&before=<run id>&run=<run id>
+        # E2E runs + capture verdict (ci_observe_runs.py). Always 200: a
+        # registry with no complete answer is a data gap the table must show
+        # as "unknown", not an error the dashboard would render as an empty
+        # panel.
         elif parsed.path == "/api/ci-observe/runs":
-            params = parse_qs(parsed.query)
+            # keep_blank_values: an explicit run= with an empty Find box must
+            # read as "no rows", not disappear and return the whole window.
+            params = parse_qs(parsed.query, keep_blank_values=True)
             data = self.exporter.get_ci_observe_runs_json(params)
+            payload = json.dumps(data, default=str)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(payload.encode())
+
+        # GET /api/ci-observe/capture?capture_id=<id>
+        # One capture document for the Capture dashboard: the session trace
+        # fetched by id and classified, with the coverage invariant. Tempo is
+        # read once here; the document is cached and single-flighted.
+        elif parsed.path == "/api/ci-observe/capture":
+            params = parse_qs(parsed.query)
+            data = self.exporter._capture_view.get_json(params)
+            payload = json.dumps(data, default=str)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(payload.encode())
+
+        # GET /api/ci-observe/captures?days=<n>&limit=<n>&capture_id=&run_id=&suite=
+        # The registry rows, read from SQLite only. Never queries Prometheus,
+        # Loki or Tempo: the 60-second poller already did.
+        elif parsed.path == "/api/ci-observe/captures":
+            # keep_blank_values: an explicit but empty capture_id/run_id/suite
+            # lookup answers "no rows" instead of listing every capture.
+            params = parse_qs(parsed.query, keep_blank_values=True)
+            data = self.exporter.get_ci_observe_captures_json(params)
+            payload = json.dumps(data, default=str)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(payload.encode())
+
+        # GET /api/ci-observe/cohorts?days=<n>&limit=<n>
+        # Exact cohorts over the six identity fields; rows without a complete
+        # identity are listed separately as ungrouped.
+        elif parsed.path == "/api/ci-observe/cohorts":
+            params = parse_qs(parsed.query)
+            data = self.exporter.get_ci_observe_cohorts_json(params)
             payload = json.dumps(data, default=str)
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -4071,15 +5061,15 @@ class ExporterHandler(BaseHTTPRequestHandler):
                 parse_qs(parsed.query)
             )
             # A queue attempt stores no capture id. The run id does appear on
-            # every captured span, so the run cache turns it into the capture
-            # id the Capture dashboard needs. The journal stays store-only
-            # when Tempo is unavailable: an empty link is honest, a guessed
-            # one is not.
+            # every captured span, so the registry turns it into the capture
+            # id the Capture dashboard needs -- SQLite, no Tempo. The journal
+            # stays store-only when the registry cannot answer: an empty link
+            # is honest, a guessed one is not.
             runs = getattr(self.exporter, "_runs", None)
             if data.get("mode") == "pr" and data.get("attempts") and runs is not None:
                 try:
                     captures = runs.capture_ids_by_run()
-                except (OSError, ValueError):
+                except (OSError, ValueError, sqlite3.Error):
                     captures = {}
                 for attempt in data["attempts"]:
                     capture_ids = []
@@ -4138,6 +5128,12 @@ def main():
     server.daemon_threads = True
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
+
+    # The capture registry polls Prometheus, Loki and the info metric every
+    # 60 seconds. Started before the job history load so the first /runs
+    # request has an answer as soon as possible; until then every run is
+    # `unknown`, never `not collected`.
+    exporter.start_capture_poll()
 
     # Load recent job history so the table isn't empty on startup.
     # HTTP server is already running so /metrics and /api/jobs are available
