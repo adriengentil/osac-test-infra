@@ -12,7 +12,7 @@ The principles behind the pages, the current gaps, and the roadmap are in [`obse
 
 ## Start here
 
-One table of recent E2E runs: Run, Job, Repo, PR, Branch, Trigger, Result, Recorded, Created and GitHub. Every identifier is a link. `No` under Recorded means the job sent no test data.
+One table of recent E2E runs: Run, Job, Repo, PR, Branch, Trigger, Result, Recorded, Created and GitHub. Every identifier is a link. `No` under Recorded means the job sent no test data; `Unknown` means the check could not judge.
 
 ## E2E run
 
@@ -20,6 +20,7 @@ One table of recent E2E runs: Run, Job, Repo, PR, Branch, Trigger, Result, Recor
 |---|---|
 | Summary | Result, tests run, and test time. Result comes from GitHub. |
 | Failures | Failed tests, error messages, test time, and a link to the full artifact. |
+| Jobs and steps | Every job, its result and duration, and each job's steps with their durations. |
 | Test list | Every test, result, start time, and duration. |
 | Run info | GitHub run, pull request, workflow, commit, and test paths, with links. |
 | Cluster | Pods, CPU by pod, memory by pod, node CPU, and node memory for the run window. |
@@ -28,9 +29,18 @@ A run has detailed data only when its recording arrived. A missing recording doe
 
 ## Pull requests
 
-The page shows recent pull requests, typical and slow-end stage times, and the selected pull request.
+| Section | Contents |
+|---|---|
+| Selected pull request | Identity, state, and the dates of each stage. |
+| Time in each stage | Authoring, review, waiting, queue and merge, with the reason a stage is unknown. |
+| E2E runs | Every run the pull request made, oldest first, one row per suite. A pull-request run shows its commit, so a rebase is a new code version. A merge-queue run tests a temporary merge commit and shows no code version. Rows open the run page or GitHub. |
+| Queue attempts | Each merge-queue entry, its duration, and whether it was ejected and why. |
+| Recent pull requests and stage times | The browse tables for the selected days. |
 
-An **ejection** means a pull request left the merge queue without merging. GitHub does not keep queue history, so the page derives it from a failed queue run and a GitHub comment.
+An open pull request is read from GitHub when the page loads. Its runs are
+already stored; the saved stage history starts after it ends.
+
+An **ejection** means a pull request left the merge queue without merging. GitHub does not keep queue history, so the page derives it from a failed queue run and a GitHub comment. For an open pull request, the failed queue run is the only signal.
 
 ## Trends
 

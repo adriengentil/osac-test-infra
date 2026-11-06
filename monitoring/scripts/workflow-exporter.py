@@ -5093,18 +5093,20 @@ class ExporterHandler(BaseHTTPRequestHandler):
             data = ci_observe_prs.CIObservePRs(db_file=prs_db_file, api=self.exporter).get_json(
                 parse_qs(parsed.query)
             )
-            # A queue attempt stores no capture id. The run id does appear on
-            # every captured span, so the registry turns it into the capture
-            # id the Capture dashboard needs -- SQLite, no Tempo. The journal
-            # stays store-only when the registry cannot answer: an empty link
-            # is honest, a guessed one is not.
-            runs = getattr(self.exporter, "_runs", None)
-            if data.get("mode") == "pr" and data.get("attempts") and runs is not None:
+            # A queue attempt and an E2E run store no capture id. The run id
+            # does appear on every captured span, so the registry turns it
+            # into the capture id the run page needs -- SQLite, no Tempo.
+            # The journal and the run list stay store-only when the registry
+            # cannot answer: an empty link is honest, a guessed one is not.
+            registry = getattr(self.exporter, "_runs", None)
+            captures = {}
+            if data.get("mode") == "pr" and registry is not None:
                 try:
-                    captures = runs.capture_ids_by_run()
+                    captures = registry.capture_ids_by_run()
                 except (OSError, ValueError, sqlite3.Error):
                     captures = {}
-                for attempt in data["attempts"]:
+            if data.get("mode") == "pr" and captures:
+                for attempt in data.get("attempts") or []:
                     capture_ids = []
                     for run_id in attempt.get("run_ids") or [attempt.get("run_id")]:
                         for capture_id in captures.get(str(run_id), []):
@@ -5113,9 +5115,45 @@ class ExporterHandler(BaseHTTPRequestHandler):
                     if capture_ids:
                         attempt["capture_ids"] = capture_ids
                         attempt["capture_url"] = (
-                            "/d/ci-observe-runs/ci-observe-e28094-run-investigation"
+                            "/d/ci-observe-runs/ci-observe-e28094-e2e-run"
                             f"?var-capture_id={capture_ids[0]}"
                         )
+            if data.get("mode") == "pr":
+                now = datetime.now(timezone.utc)
+                for run in data.get("runs") or []:
+                    # One pull-request-flow run holds one capture per suite,
+                    # and a rerun adds an attempt. The row names both, so the
+                    # link can only point at its own capture.
+                    capture_ids = []
+                    for capture_id in captures.get(str(run.get("run_id")), []):
+                        parsed = registry.parse_capture_id(capture_id) if registry is not None else None
+                        if (
+                            parsed
+                            and parsed["run_attempt"] == str(run.get("run_attempt") or 1)
+                            # A legacy capture names no suite: it belongs to
+                            # the whole run, so every suite row can use it.
+                            and parsed["suite"] in ("", run.get("suite_key"))
+                        ):
+                            capture_ids.append(capture_id)
+                    if capture_ids:
+                        run["capture_id"] = capture_ids[0]
+                    if registry is None:
+                        state, reason = "unknown", "the capture registry is not available"
+                    else:
+                        state, reason = registry.verdict({**run, "capture_ids": capture_ids}, now)
+                    run["recorded"] = {
+                        "capture": "yes",
+                        "not collected": "no",
+                    }.get(state, "unknown")
+                    run["recorded_reason"] = reason
+                    # A recorded run opens the run page with its capture id.
+                    # An unrecorded run has no capture to open it with, so
+                    # the GitHub link is its entry point.
+                    if run.get("capture_id"):
+                        query = f"?orgId=1&var-capture_id={urllib.parse.quote(run['capture_id'], safe='')}"
+                        if run.get("started_at_ms") and run.get("done_at_ms"):
+                            query += f"&from={run['started_at_ms']}&to={run['done_at_ms']}"
+                        run["run_url"] = "/d/ci-observe-runs/ci-observe-e28094-e2e-run" + query
             payload = json.dumps(data, default=str)
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
