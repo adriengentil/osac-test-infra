@@ -70,6 +70,16 @@
                   "text": "Still running",
                   "color": "orange",
                   "index": 2
+                },
+                "cancelled": {
+                  "text": "Canceled",
+                  "color": "orange",
+                  "index": 3
+                },
+                "null": {
+                  "text": "Not finished",
+                  "color": "orange",
+                  "index": 4
                 }
               }
             }
@@ -111,7 +121,7 @@
             "method": "GET",
             "data": ""
           },
-          "root_selector": "session",
+          "root_selector": "summary",
           "columns": [
             {
               "selector": "status",
@@ -141,7 +151,17 @@
         "defaults": {
           "unit": "none",
           "noValue": "Test count not available",
-          "mappings": [],
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "null": {
+                  "text": "Test count not available",
+                  "index": 0
+                }
+              }
+            }
+          ],
           "thresholds": {
             "mode": "absolute",
             "steps": [
@@ -179,7 +199,7 @@
             "method": "GET",
             "data": ""
           },
-          "root_selector": "session",
+          "root_selector": "summary",
           "columns": [
             {
               "selector": "tests",
@@ -209,7 +229,17 @@
         "defaults": {
           "unit": "s",
           "noValue": "Test time unavailable",
-          "mappings": [],
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "null": {
+                  "text": "Test time unavailable",
+                  "index": 0
+                }
+              }
+            }
+          ],
           "thresholds": {
             "mode": "absolute",
             "steps": [
@@ -247,7 +277,7 @@
             "method": "GET",
             "data": ""
           },
-          "root_selector": "session",
+          "root_selector": "summary",
           "columns": [
             {
               "selector": "duration_seconds",
