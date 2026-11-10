@@ -179,7 +179,9 @@ fi
 # --- Reconcile the NetBox devices and BMC Secrets with the raw inventory ---
 # The runner's python3 is not the repository environment: install the
 # pynetbox version the repository's uv.lock pins (requests comes along).
-pip install --quiet 'pynetbox==7.8.0' 'requests==2.34.2'
+# python3 -m pip: bind the install to the interpreter that runs the
+# reconciler — a bare pip may belong to another environment.
+python3 -m pip install --quiet 'pynetbox==7.8.0' 'requests==2.34.2'
 
 OSAC_NETBOX_URL="${NETBOX_URL}" \
 OSAC_NETBOX_TOKEN="${NETBOX_TOKEN}" \
