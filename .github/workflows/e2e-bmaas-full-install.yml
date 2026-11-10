@@ -770,6 +770,10 @@ jobs:
             sleep 2
           done
 
+      - name: Install uv
+        if: inputs.inventory-backend == 'netbox'
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78  # v7.6.0
+
       # NetBox device setup needs everything the reconciler drives: NetBox
       # (deployed by install-infra's bmaas-netbox-ci profile), the OSAC
       # Secret API (install-osac), and the extracted osac CLI -- so it runs
