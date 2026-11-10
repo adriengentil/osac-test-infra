@@ -19,7 +19,9 @@
 # derives the same) and the clone network gateway discovery. The cluster
 # is selected through KUBECONFIG or oc's default kubeconfig. The osac CLI
 # must be on PATH and logged in: the reconcile creates the BMC Secrets
-# through the OSAC Secret API.
+# through the OSAC Secret API. uv must be on PATH too (the workflow provides
+# it through astral-sh/setup-uv): the reconcile runs in this repository's
+# uv environment.
 #
 # Required env:
 #   CLONE_NAME   — cluster-tool clone name (finds the libvirt network)
@@ -69,6 +71,7 @@ if [[ -n "${GITHUB_ENV:-}" ]]; then
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 VIRSH="virsh -c qemu:///system"
 
 # --- Discover the clone's libvirt network and its gateway IP ---
@@ -177,14 +180,21 @@ if [[ "${NETBOX_URL}" == http://* ]]; then
 fi
 
 # --- Reconcile the NetBox devices and BMC Secrets with the raw inventory ---
-# The runner's python3 is not the repository environment: install the
-# pynetbox version the repository's uv.lock pins (requests comes along).
-# python3 -m pip: bind the install to the interpreter that runs the
-# reconciler — a bare pip may belong to another environment.
-python3 -m pip install --quiet 'pynetbox==7.8.0' 'requests==2.34.2'
+# The reconciler's dependencies (pynetbox, requests) are declared in this
+# repository's pyproject.toml and locked in its uv.lock: sync that exact
+# environment and run the reconciler inside it — nothing is installed into
+# the runner's interpreter. --directory pins uv to the repository root
+# regardless of the caller's CWD; --frozen uses the lock as-is, like the
+# test container's own uv sync.
+command -v uv >/dev/null 2>&1 || {
+  echo "ERROR: uv is not on PATH — run astral-sh/setup-uv before this script." >&2
+  exit 1
+}
+uv --directory "${REPO_ROOT}" sync --frozen
 
 OSAC_NETBOX_URL="${NETBOX_URL}" \
 OSAC_NETBOX_TOKEN="${NETBOX_TOKEN}" \
+  uv --directory "${REPO_ROOT}" run --frozen \
   python3 "${SCRIPT_DIR}/reconcile-netbox-devices.py" "${RECONCILE_ARGS[@]}"
 
 echo "==> Virtual NetBox device setup complete. ${BMH_COUNT} devices staged."
