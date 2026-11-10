@@ -280,8 +280,9 @@ def bmc_secret_name(host_name: str) -> str:
 def list_secret_labels(args: argparse.Namespace) -> dict[str, dict[str, str]]:
     """Map Secret name -> labels for the tenant's OSAC Secrets.
 
-    One list call instead of one get per host. Secret data is omitted
-    from list responses, so nothing sensitive is read or printed.
+    One list call instead of one get per host. List responses omit
+    Secret data (a Get would return it), so nothing sensitive is read
+    or printed.
     """
     result = run_osac(["--tenant", args.secret_tenant, "get", "secrets", "-o", "json"])
     payload = json.loads(result.stdout)
@@ -299,11 +300,13 @@ def list_secret_labels(args: argparse.Namespace) -> dict[str, dict[str, str]]:
 def ensure_bmc_secrets(hosts: list[Host], device_ids: dict[str, str], args: argparse.Namespace) -> None:
     """One BMC Secret per host, labeled for its device.
 
-    The Secret's data cannot be read back, so:
-    - an existing Secret with the right device label is kept as-is;
-    - one with a stale label (the device was recreated with a new id) is
-      deleted and recreated from the inventory — the source of truth for
-      credentials.
+    Secret data is never read back: a Get would return it (only List
+    omits it), and the credentials would transit this tool for no
+    benefit. The device label decides instead:
+    - right label — a previous run created this Secret from the same
+      inventory entry; keep it as-is.
+    - stale label (the device was recreated with a new id) — delete and
+      recreate from the inventory, the source of truth for credentials.
     """
     print("==> Ensuring BMC Secrets in the OSAC Secret API...")
     existing = list_secret_labels(args)
