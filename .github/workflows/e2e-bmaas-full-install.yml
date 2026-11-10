@@ -190,8 +190,11 @@ jobs:
     steps:
       - name: Validate inventory backend
         if: inputs.inventory-backend != 'metal3' && inputs.inventory-backend != 'netbox'
+        # The value is untrusted by definition here (the guard only lets
+        # invalid values through), so it is read from the job env — never
+        # expanded into the script, where it could inject shell code.
         run: |
-          echo "ERROR: inventory-backend must be 'metal3' or 'netbox', got '${{ inputs.inventory-backend }}'." >&2
+          echo "ERROR: inventory-backend must be 'metal3' or 'netbox', got '${INVENTORY_BACKEND}'." >&2
           exit 1
 
       - name: Checkout repository
