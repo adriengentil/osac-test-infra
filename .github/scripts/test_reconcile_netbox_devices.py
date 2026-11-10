@@ -2,14 +2,18 @@
 """Tests for reconcile-netbox-devices.py.
 
 Unit tests cover the device custom-field rendering and the Secret API
-name and label derivation; the inventory library itself is covered by
-test_raw_inventory.py. The end-to-end tests run the script as a
+name and label derivation. The end-to-end tests run the script as a
 subprocess with a stub pynetbox package on PYTHONPATH (the script
-imports it lazily, so these tests themselves run without it) and a
-fake osac CLI on PATH, verifying the schema bootstrap, the staged
-devices created per inventory host, the per-device BMC Secrets in the
-Secret API, the deletion of devices the inventory no longer lists, and
-the emptied-inventory cleanup.
+imports it lazily, so these tests run without it) and a fake osac CLI
+on PATH, verifying:
+
+- the schema bootstrap
+- one staged device per inventory host
+- one BMC Secret per host in the Secret API
+- the deletion of devices the inventory no longer lists
+- the emptied-inventory cleanup
+
+The inventory library itself is covered by test_raw_inventory.py.
 
 Run directly: python3 -I .github/scripts/test_reconcile_netbox_devices.py
 """

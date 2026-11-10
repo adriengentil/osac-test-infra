@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
 """Reconcile NetBox devices with a raw inventory file.
 
-One command for the whole device lifecycle, the NetBox-mode counterpart
-of reconcile-bmhs.py: ensures the NetBox schema (site, manufacturer,
-device type, role and the OSAC custom fields), removes the group's
-devices the inventory no longer lists — their Secret API BMC Secrets go
-too; an emptied inventory removes them all — then creates one staged
-device per host and one BMC Secret per host in the OSAC Secret API,
-labeled osac.openshift.io/netbox-device-<device-id> for the operator's
-credential lookup.
+One command for the whole device lifecycle — the NetBox-mode counterpart
+of reconcile-bmhs.py. Per run:
 
-The NetBox connection comes from --url/--token (the OSAC_NETBOX_* env
-vars work too); plain HTTP requires --insecure. The Secret API is
-reached through the osac CLI, which must be on PATH and logged in.
-pynetbox and requests are imported lazily, only when a session actually
-needs configuring, so the unit tests run without them.
+1. Ensure the NetBox schema: site, manufacturer, device type, role and
+   the OSAC custom fields.
+2. Delete the group's devices the inventory no longer lists — an emptied
+   inventory removes them all. Their Secret API BMC Secrets go too.
+3. Create one staged device per host, plus one BMC Secret per host in the
+   OSAC Secret API labeled osac.openshift.io/netbox-device-<device-id>
+   for the operator's credential lookup.
+
+Connection:
+- NetBox: --url/--token, or the OSAC_NETBOX_* env vars. Plain HTTP needs
+  --insecure.
+- Secret API: the osac CLI on PATH, logged in.
+- pynetbox/requests import lazily, only when a session is configured, so
+  the unit tests run without them.
 
 Run directly: python3 .github/scripts/reconcile-netbox-devices.py --help
 """
@@ -84,11 +87,10 @@ def run_osac(args: list[str], *, check: bool = True) -> subprocess.CompletedProc
 def build_netbox_api(url: str, token: str, ca_file: str | None, insecure: bool) -> Api:
     """Construct the pynetbox API; third-party imports stay lazy.
 
-    The session always mounts a timeout adapter: a plain requests.Session
+    The session always mounts a timeout adapter — a plain requests.Session
     has no default timeout, so a stalled NetBox connection would hang the
-    step until the job timeout kills it. TLS verification is customized
-    only when a CA file or the insecure opt-in is given; otherwise the
-    session verifies against the system roots.
+    step until the job timeout kills it. TLS: system roots by default; a
+    CA file or the insecure opt-in overrides that.
     """
     import pynetbox
     import requests
@@ -297,10 +299,11 @@ def list_secret_labels(args: argparse.Namespace) -> dict[str, dict[str, str]]:
 def ensure_bmc_secrets(hosts: list[Host], device_ids: dict[str, str], args: argparse.Namespace) -> None:
     """One BMC Secret per host, labeled for its device.
 
-    The Secret's data cannot be read back, so an existing Secret with
-    the right device label is kept as-is; one with a stale label (the
-    device was recreated with a new id) is deleted and recreated from
-    the inventory — the source of truth for credentials.
+    The Secret's data cannot be read back, so:
+    - an existing Secret with the right device label is kept as-is;
+    - one with a stale label (the device was recreated with a new id) is
+      deleted and recreated from the inventory — the source of truth for
+      credentials.
     """
     print("==> Ensuring BMC Secrets in the OSAC Secret API...")
     existing = list_secret_labels(args)

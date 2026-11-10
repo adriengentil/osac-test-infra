@@ -103,9 +103,11 @@ KUBECONFIG=/path/to/kubeconfig python3 .github/scripts/reconcile-bmhs.py \
 When the cluster's bare-metal fulfillment runs the NetBox inventory
 backend, the same raw inventory drives NetBox devices instead of
 BareMetalHosts — the operator creates each BMH itself when it claims a
-device. Needs the `osac` CLI on PATH, logged in, and the NetBox
-endpoint and token (`pynetbox` comes with this repository's Python
-environment):
+device.
+
+Prerequisites: the `osac` CLI on PATH and logged in, plus the NetBox
+endpoint and token. `pynetbox` comes with this repository's Python
+environment:
 
 ```bash
 python3 .github/scripts/reconcile-netbox-devices.py \
@@ -124,12 +126,16 @@ python3 .github/scripts/reconcile-netbox-devices.py \
   --inventory-file "${HOME}/virtual-bmh-inventory.json" --insecure
 ```
 
-One staged device per host, stamped with the OSAC custom fields, plus
-one BMC Secret per host in the OSAC Secret API, labeled for its device.
-The NetBox schema (site, role, manufacturer, device type, custom
-fields) is bootstrapped when missing. Idempotent — re-running creates
-nothing — and an emptied inventory removes the whole group, devices and
-Secrets: that is the NetBox-mode cleanup path.
+Per run:
+
+- one staged device per host, stamped with the OSAC custom fields
+- one BMC Secret per host in the OSAC Secret API, labeled for its device
+- the NetBox schema (site, role, manufacturer, device type, custom
+  fields) bootstrapped when missing
+
+Idempotent — re-running creates nothing. An emptied inventory removes
+the whole group, devices and Secrets: that is the NetBox-mode cleanup
+path.
 
 ## 6. Clean up
 
@@ -165,10 +171,10 @@ rm -rf "${HOME}/virtual-bmh-disks" "${HOME}/sushy-local" \
 
 `.github/scripts/setup-virtual-bmh.sh` — the CI orchestrator — wires
 exactly these tools and is the shortest complete reference. Its NetBox
-counterpart, `.github/scripts/setup-virtual-netbox-devices.sh`, swaps
-only the last step for `reconcile-netbox-devices.py` and adds the
-NetBox token lookup (the superuser Secret's `api_token` key) plus a
-port-forward to the in-cluster service. The
+counterpart, `.github/scripts/setup-virtual-netbox-devices.sh`, differs
+only in the last step: `reconcile-netbox-devices.py`, the NetBox token
+lookup (the superuser Secret's `api_token` key) and a port-forward to
+the in-cluster service. The
 semantics (naming scheme, verified deletions, reconcile rules) live in
 each tool's docstring and in the `raw_inventory.py` library that owns
 the inventory format.

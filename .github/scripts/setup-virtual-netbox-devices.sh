@@ -10,18 +10,19 @@
 #   4. reconcile-netbox-devices.py  — NetBox devices and Secret API BMC
 #                                     Secrets reconciled with the raw inventory
 #
-# The counterpart of setup-virtual-bmh.sh: the VMs and the Redfish
-# emulation are identical — only the inventory handover differs, NetBox
-# devices instead of BareMetalHosts, because the operator creates each
-# BMH itself when it claims a device.
+# Same VMs and Redfish emulation as setup-virtual-bmh.sh; only the
+# inventory differs: NetBox devices instead of BMHs — the operator
+# creates each BMH itself when it claims a device.
 #
-# This script owns the CI specifics: CLONE_NAME-derived names (teardown.sh
-# derives the same) and the clone network gateway discovery. The cluster
-# is selected through KUBECONFIG or oc's default kubeconfig. The osac CLI
-# must be on PATH and logged in: the reconcile creates the BMC Secrets
-# through the OSAC Secret API. uv must be on PATH too (the workflow provides
-# it through astral-sh/setup-uv): the reconcile runs in this repository's
-# uv environment.
+# This script owns the CI specifics only: CLONE_NAME-derived names
+# (teardown.sh derives the same) and the clone network gateway discovery.
+# The cluster is selected through KUBECONFIG or oc's default kubeconfig.
+#
+# Must be on PATH before running:
+#   osac — logged in; the reconcile creates the BMC Secrets through the
+#          OSAC Secret API
+#   uv   — the reconcile runs in this repository's uv environment (the
+#          workflow provides uv through astral-sh/setup-uv)
 #
 # Required env:
 #   CLONE_NAME   — cluster-tool clone name (finds the libvirt network)
@@ -124,14 +125,14 @@ if [[ -z "${NETBOX_TOKEN:-}" ]]; then
 fi
 
 # --- Reach the NetBox service ---
-# The runner cannot resolve the in-cluster service DNS: forward the
-# service port to the loopback unless an URL was given (a route, a lab
-# NetBox). The forward dies with this script — the reconcile is the only
-# consumer.
-# A plain-HTTP URL that is passed in needs NETBOX_ALLOW_HTTP=true as
-# explicit consent — the token would cross the network unencrypted.
-# The loopback port-forward this script starts when no URL is given needs
-# no consent: the token never leaves the runner.
+# A passed plain-HTTP URL needs NETBOX_ALLOW_HTTP=true as explicit
+# consent: the token would cross the network unencrypted. The script's
+# own loopback port-forward needs no consent — the token never leaves
+# the runner.
+# Without a URL, the in-cluster service DNS is unresolvable from the
+# runner: forward the service port to the loopback instead (a route or a
+# lab NetBox can be passed as NETBOX_URL). The forward dies with this
+# script — the reconcile is the only consumer.
 if [[ -n "${NETBOX_URL:-}" && "${NETBOX_URL}" == http://* && "${NETBOX_ALLOW_HTTP:-}" != "true" ]]; then
   echo "ERROR: NETBOX_URL ${NETBOX_URL} uses plain HTTP." >&2
   echo "       Set NETBOX_ALLOW_HTTP=true to consent to sending the NetBox token unencrypted, or use an https URL." >&2
@@ -180,12 +181,11 @@ if [[ "${NETBOX_URL}" == http://* ]]; then
 fi
 
 # --- Reconcile the NetBox devices and BMC Secrets with the raw inventory ---
-# The reconciler's dependencies (pynetbox, requests) are declared in this
-# repository's pyproject.toml and locked in its uv.lock: sync that exact
-# environment and run the reconciler inside it — nothing is installed into
-# the runner's interpreter. --directory pins uv to the repository root
-# regardless of the caller's CWD; --frozen uses the lock as-is, like the
-# test container's own uv sync.
+# Run the reconciler in this repository's uv environment: pynetbox and
+# requests come from pyproject.toml + uv.lock, so nothing is installed
+# into the runner's interpreter.
+#   --directory — the repository root, whatever the caller's CWD
+#   --frozen    — the lock as-is, like the test container's uv sync
 command -v uv >/dev/null 2>&1 || {
   echo "ERROR: uv is not on PATH — run astral-sh/setup-uv before this script." >&2
   exit 1
