@@ -14,6 +14,7 @@ Run directly: python3 .github/scripts/manage-virtual-bmh-vms.py --help
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import secrets
 import shutil
@@ -49,6 +50,23 @@ BMC_ADDRESS_TEMPLATE = "redfish-virtualmedia+http://{host}:{port}/redfish/v1/Sys
 # Storage files are named after the VM: <name>.qcow2 and <name>-VARS.fd.
 DISK_SUFFIX = ".qcow2"
 VARS_SUFFIX = "-VARS.fd"
+
+# virtio-blk exposes at most 20 serial bytes to the guest; Metal3 inspection
+# reports the same truncation, so longer serials would silently collide.
+MAX_SERIAL_BYTES = 20
+
+
+def vm_disk_serial(name: str) -> str:
+    """Deterministic disk serial for a VM name.
+
+    The serial survives destroy/recreate cycles of the same VM name, so
+    Metal3 root device hints can match on it instead of the unstable
+    virtio device names. Names within the virtio-blk serial length are
+    used as-is for readability; longer names map to a stable hash.
+    """
+    if len(name) <= MAX_SERIAL_BYTES:
+        return name
+    return hashlib.sha256(name.encode()).hexdigest()[:MAX_SERIAL_BYTES]
 
 
 def fail(message: str) -> None:
@@ -124,6 +142,7 @@ def render_vm_xml(
       <driver name='qemu' type='qcow2'/>
       <source file='{disk_path}'/>
       <target dev='vda' bus='virtio'/>
+      <serial>{vm_disk_serial(name)}</serial>
     </disk>
     <interface type='network'>
       <mac address='{mac}'/>
