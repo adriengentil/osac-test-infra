@@ -52,11 +52,7 @@ DISK_SUFFIX = ".qcow2"
 VARS_SUFFIX = "-VARS.fd"
 SERIAL_LOG_SUFFIX = ".serial.log"
 
-# Serial on every virtual BMH disk: a stable identity the Metal3 root
-# device hint can match on, since virtio device names reshuffle with
-# probe order. One serial fits every VM — each domain exposes exactly
-# one disk, so hints never need to tell VMs apart. virtio-blk exposes
-# at most 20 serial bytes; this one fits.
+# Stable disk identity for the Metal3 root device hint to match on.
 DISK_SERIAL = "osac-virt-root"
 
 
