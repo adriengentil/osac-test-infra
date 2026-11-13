@@ -13,6 +13,7 @@ Run directly: python3 .github/scripts/test_manage_virtual_bmh_vms.py
 """
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import subprocess
@@ -48,6 +49,11 @@ def _host(name: str) -> raw_inventory.Host:
         cpu=4,
         memory_mib=8192,
     )
+
+
+def _serial(name: str) -> str:
+    """Expected serial: SHA-256 of the name, truncated to the virtio-blk size."""
+    return hashlib.sha256(name.encode()).hexdigest()[:20]
 
 
 class RunVirshTests(unittest.TestCase):
@@ -106,7 +112,7 @@ class RenderVmXmlTests(unittest.TestCase):
             "<mac address='52:54:00:bb:cc:01'/>",
             "<source network='test-infra-net-clone'/>",
             "<source file='/disks/grp-1.qcow2'/>",
-            "<serial>grp-1</serial>",
+            f"<serial>{_serial('grp-1')}</serial>",
             "<nvram>/disks/grp-1-VARS.fd</nvram>",
             "/usr/share/OVMF/OVMF_CODE.secboot.fd",
         ):
@@ -114,13 +120,22 @@ class RenderVmXmlTests(unittest.TestCase):
 
 
 class VmDiskSerialTests(unittest.TestCase):
-    def test_short_names_are_used_as_the_serial(self) -> None:
-        self.assertEqual(manage_virtual_bmh_vms.vm_disk_serial("grp-1"), "grp-1")
+    def test_all_names_map_to_a_hashed_serial(self) -> None:
+        for name in ("grp-1", "virtual-bmh-1c320d51-8d"):
+            serial = manage_virtual_bmh_vms.vm_disk_serial(name)
+            self.assertEqual(serial, _serial(name))
+            self.assertNotEqual(serial, name)
+            self.assertEqual(len(serial), manage_virtual_bmh_vms.MAX_SERIAL_BYTES)
 
-    def test_long_names_map_to_a_stable_serial(self) -> None:
+    def test_multibyte_names_stay_within_the_serial_size(self) -> None:
+        name = "é" * 10 + "a"  # 11 characters, 21 UTF-8 bytes
+        serial = manage_virtual_bmh_vms.vm_disk_serial(name)
+        self.assertEqual(serial, _serial(name))
+        self.assertEqual(len(serial.encode("utf-8")), manage_virtual_bmh_vms.MAX_SERIAL_BYTES)
+
+    def test_serials_are_stable_and_unique_per_name(self) -> None:
         name = "virtual-bmh-1c320d51-8d"
         serial = manage_virtual_bmh_vms.vm_disk_serial(name)
-        self.assertEqual(len(serial), manage_virtual_bmh_vms.MAX_SERIAL_BYTES)
         self.assertEqual(serial, manage_virtual_bmh_vms.vm_disk_serial(name))
         self.assertNotEqual(serial, manage_virtual_bmh_vms.vm_disk_serial(name[:-1]))
 
@@ -137,7 +152,7 @@ class VmDiskSerialTests(unittest.TestCase):
             network="test-infra-net-clone",
         )
         self.assertIn(
-            f"<serial>{manage_virtual_bmh_vms.vm_disk_serial(name)}</serial>", xml
+            f"<serial>{_serial(name)}</serial>", xml
         )
 
 

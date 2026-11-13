@@ -52,7 +52,7 @@ DISK_SUFFIX = ".qcow2"
 VARS_SUFFIX = "-VARS.fd"
 
 # virtio-blk exposes at most 20 serial bytes to the guest; Metal3 inspection
-# reports the same truncation, so longer serials would silently collide.
+# reports the same truncation, so the serial must fit within that size.
 MAX_SERIAL_BYTES = 20
 
 
@@ -61,11 +61,9 @@ def vm_disk_serial(name: str) -> str:
 
     The serial survives destroy/recreate cycles of the same VM name, so
     Metal3 root device hints can match on it instead of the unstable
-    virtio device names. Names within the virtio-blk serial length are
-    used as-is for readability; longer names map to a stable hash.
+    virtio device names. Every name maps to the same stable hash,
+    truncated to the virtio-blk serial size.
     """
-    if len(name) <= MAX_SERIAL_BYTES:
-        return name
     return hashlib.sha256(name.encode()).hexdigest()[:MAX_SERIAL_BYTES]
 
 
