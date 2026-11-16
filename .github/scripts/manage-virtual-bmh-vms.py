@@ -52,6 +52,9 @@ DISK_SUFFIX = ".qcow2"
 VARS_SUFFIX = "-VARS.fd"
 SERIAL_LOG_SUFFIX = ".serial.log"
 
+# Stable disk identity for the Metal3 root device hint to match on.
+DISK_SERIAL = "osac-virt-root"
+
 
 def fail(message: str) -> None:
     print(f"ERROR: {message}", file=sys.stderr)
@@ -127,6 +130,7 @@ def render_vm_xml(
       <driver name='qemu' type='qcow2'/>
       <source file='{disk_path}'/>
       <target dev='vda' bus='virtio'/>
+      <serial>{DISK_SERIAL}</serial>
     </disk>
     <interface type='network'>
       <mac address='{mac}'/>
