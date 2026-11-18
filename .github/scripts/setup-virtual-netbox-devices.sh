@@ -31,12 +31,14 @@
 #   BMH_COUNT        — number of virtual hosts to create (default: 2)
 #   SUSHY_PORT       — sushy-tools listen port (default: 8000)
 #   SUSHY_CACHE_PORT — nginx ISO cache listen port (default: 8080)
-#   NETBOX_URL       — NetBox base URL. Default: an oc port-forward to the
-#                      in-cluster service (plain HTTP on the loopback).
+#   NETBOX_URL       — NetBox base URL. Default: the https URL of the
+#                      `netbox` Route the osac-infra chart creates in
+#                      NETBOX_NAMESPACE (the fallback passes the reconcile's
+#                      TLS-verification opt-out: the Route's edge certificate
+#                      is the router's, not trusted by CI runners).
 #   NETBOX_TOKEN     — NetBox API token. Default: the api_token key of the
 #                      superuser Secret the NetBox chart pre-provisions.
 #   NETBOX_NAMESPACE — namespace of the NetBox release (default: osac-infra)
-#   NETBOX_SERVICE   — NetBox service name (default: osac-infra-netbox)
 #   NETBOX_ALLOW_HTTP — explicit consent for a passed plain-HTTP URL
 #   NETBOX_SECRET    — NetBox superuser Secret name (default:
 #                      osac-infra-netbox-superuser)
@@ -52,9 +54,7 @@ BMH_COUNT="${BMH_COUNT:-2}"
 SUSHY_PORT="${SUSHY_PORT:-8000}"
 SUSHY_CACHE_PORT="${SUSHY_CACHE_PORT:-8080}"
 NETBOX_NAMESPACE="${NETBOX_NAMESPACE:-osac-infra}"
-NETBOX_SERVICE="${NETBOX_SERVICE:-osac-infra-netbox}"
 NETBOX_SECRET="${NETBOX_SECRET:-osac-infra-netbox-superuser}"
-NETBOX_PORT_FORWARD_PORT="${NETBOX_PORT_FORWARD_PORT:-18080}"
 
 CT_NETWORK="test-infra-net-${CLONE_NAME}"
 VM_DISK_DIR="/tmp/virtual-bmh-disks-${CLONE_NAME}"
@@ -124,58 +124,35 @@ if [[ -z "${NETBOX_TOKEN:-}" ]]; then
     -o jsonpath='{.data.api_token}' | base64 -d)"
 fi
 
-# --- Reach the NetBox service ---
+# --- Resolve the NetBox URL ---
+# NETBOX_URL comes from the caller (a lab NetBox, an exposed route) or
+# defaults to the `netbox` Route the osac-infra chart creates in
+# NETBOX_NAMESPACE. The chart Route is edge-terminated with the router's
+# certificate, which CI runners do not trust, so the Route fallback passes
+# the reconcile's TLS-verification opt-out; a passed URL keeps verification.
+RECONCILE_ARGS=(--inventory-file "${INVENTORY_FILE}")
+if [[ -z "${NETBOX_URL:-}" ]]; then
+  NETBOX_HOST="$(oc get route netbox -n "${NETBOX_NAMESPACE}" -o jsonpath='{.spec.host}' 2>/dev/null || true)"
+  if [[ -z "${NETBOX_HOST}" ]]; then
+    echo "ERROR: NETBOX_URL is unset and no 'netbox' Route exists in namespace ${NETBOX_NAMESPACE}." >&2
+    echo "       Pass NETBOX_URL, or install the NetBox chart (it creates the Route)." >&2
+    exit 1
+  fi
+  NETBOX_URL="https://${NETBOX_HOST}"
+  RECONCILE_ARGS+=(--insecure)
+fi
+
 # A passed plain-HTTP URL needs NETBOX_ALLOW_HTTP=true as explicit
-# consent: the token would cross the network unencrypted. The script's
-# own loopback port-forward needs no consent — the token never leaves
-# the runner.
-# Without a URL, the in-cluster service DNS is unresolvable from the
-# runner: forward the service port to the loopback instead (a route or a
-# lab NetBox can be passed as NETBOX_URL). The forward dies with this
-# script — the reconcile is the only consumer.
-if [[ -n "${NETBOX_URL:-}" && "${NETBOX_URL}" == http://* && "${NETBOX_ALLOW_HTTP:-}" != "true" ]]; then
+# consent: the token would cross the network unencrypted.
+if [[ "${NETBOX_URL}" == http://* && "${NETBOX_ALLOW_HTTP:-}" != "true" ]]; then
   echo "ERROR: NETBOX_URL ${NETBOX_URL} uses plain HTTP." >&2
   echo "       Set NETBOX_ALLOW_HTTP=true to consent to sending the NetBox token unencrypted, or use an https URL." >&2
   exit 1
 fi
 
-RECONCILE_ARGS=(--inventory-file "${INVENTORY_FILE}")
-if [[ -n "${NETBOX_URL:-}" ]]; then
-  PORT_FORWARD_LOG=""
-else
-  echo "==> Port-forwarding the NetBox service..."
-  PORT_FORWARD_LOG="${HOME}/netbox-port-forward-${CLONE_NAME}.log"
-  # Local port 0: pick a free port instead of a fixed one, so concurrent
-  # jobs on the same runner never collide (and a probe can never be
-  # answered by another job's forward).
-  oc port-forward -n "${NETBOX_NAMESPACE}" "svc/${NETBOX_SERVICE}" \
-    0:80 >"${PORT_FORWARD_LOG}" 2>&1 &
-  PORT_FORWARD_PID=$!
-  trap 'kill "${PORT_FORWARD_PID}" 2>/dev/null || true' EXIT
-  NETBOX_URL=""
-  for attempt in $(seq 1 30); do
-    if ! kill -0 "${PORT_FORWARD_PID}" 2>/dev/null; then
-      echo "ERROR: the NetBox port-forward exited before becoming ready." >&2
-      tail "${PORT_FORWARD_LOG}" >&2 || true
-      exit 1
-    fi
-    assigned="$(grep -oE '127\.0\.0\.1:[0-9]+' "${PORT_FORWARD_LOG}" | head -1 || true)"
-    if [[ -n "${assigned}" ]] && curl -sf "http://${assigned}/api/" >/dev/null 2>&1; then
-      NETBOX_URL="http://${assigned}"
-      break
-    fi
-    if [[ "${attempt}" -eq 30 ]]; then
-      echo "ERROR: NetBox not reachable through the port-forward." >&2
-      tail "${PORT_FORWARD_LOG}" >&2 || true
-      exit 1
-    fi
-    sleep 2
-  done
-fi
-
-# Plain HTTP — a consented passed URL, or the script's own loopback
-# port-forward — needs the reconcile's explicit opt-in; an https URL
-# keeps TLS verification.
+# Plain HTTP — a consented passed URL — needs the reconcile's explicit
+# opt-in; an https URL keeps TLS verification (unless it came from the
+# Route fallback above).
 if [[ "${NETBOX_URL}" == http://* ]]; then
   RECONCILE_ARGS+=(--insecure)
 fi

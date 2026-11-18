@@ -801,6 +801,9 @@ jobs:
         env:
           KUBECONFIG: ${{ runner.temp }}/kubeconfig
           INSTALLER_NAMESPACE: ${{ inputs.namespace }}
+          # The netbox release lands in the installer namespace in CI; the
+          # script's Route fallback looks the `netbox` Route up there.
+          NETBOX_NAMESPACE: ${{ inputs.namespace }}
         run: |
           # The extracted binary is named osac-cli-bin; expose it as `osac`
           # on PATH for both this login and reconcile-netbox-devices.py.

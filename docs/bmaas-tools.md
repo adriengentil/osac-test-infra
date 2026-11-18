@@ -173,9 +173,8 @@ rm -rf "${HOME}/virtual-bmh-disks" "${HOME}/sushy-local" \
 `.github/scripts/setup-virtual-bmh.sh` — the CI orchestrator — wires
 exactly these tools and is the shortest complete reference. Its NetBox
 counterpart, `.github/scripts/setup-virtual-netbox-devices.sh`, differs
-only in the last step: `reconcile-netbox-devices.py`, the NetBox token
-lookup (the superuser Secret's `api_token` key) and a port-forward to
-the in-cluster service. The
+only in the last step: `reconcile-netbox-devices.py` and the NetBox
+token lookup (the superuser Secret's `api_token` key). The
 semantics (naming scheme, verified deletions, reconcile rules) live in
 each tool's docstring and in the `raw_inventory.py` library that owns
 the inventory format.
