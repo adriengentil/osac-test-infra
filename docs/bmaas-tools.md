@@ -37,7 +37,7 @@ Idempotent — safe to re-run.
 ## 2. Create VMs and the raw inventory
 
 ```bash
-python3 .github/scripts/manage-virtual-bmh-vms.py create \
+uv run python3 .github/scripts/manage-virtual-bmh-vms.py create \
   --inventory-file "${HOME}/virtual-bmh-inventory.json" \
   --network default \
   --disk-dir "${HOME}/virtual-bmh-disks" \
@@ -60,7 +60,7 @@ jq -r '.name_prefix, (.hosts[] | "\(.name)  \(.boot_mac)  \(.bmc_address)")' \
 
 ```bash
 # add one more
-python3 .github/scripts/manage-virtual-bmh-vms.py create \
+uv run python3 .github/scripts/manage-virtual-bmh-vms.py create \
   --inventory-file "${HOME}/virtual-bmh-inventory.json" \
   --network default \
   --disk-dir "${HOME}/virtual-bmh-disks" \
@@ -69,7 +69,7 @@ python3 .github/scripts/manage-virtual-bmh-vms.py create \
 
 # remove one by name — the full '<name_prefix>-<token>' form, e.g.
 # virtual-bmh-9f2b7c31-3f; the inventory's hosts[].name entries list them
-python3 .github/scripts/manage-virtual-bmh-vms.py delete \
+uv run python3 .github/scripts/manage-virtual-bmh-vms.py delete \
   --inventory-file "${HOME}/virtual-bmh-inventory.json" \
   "$(jq -r '.hosts[0].name' "${HOME}/virtual-bmh-inventory.json")"
 ```
@@ -94,7 +94,7 @@ One command applies new and changed hosts and removes the ones the
 inventory no longer lists:
 
 ```bash
-KUBECONFIG=/path/to/kubeconfig python3 .github/scripts/reconcile-bmhs.py \
+KUBECONFIG=/path/to/kubeconfig uv run python3 .github/scripts/reconcile-bmhs.py \
   --inventory-file "${HOME}/virtual-bmh-inventory.json" \
   --namespace host-inventory
 ```
@@ -111,7 +111,7 @@ endpoint and token. `pynetbox` comes with this repository's Python
 environment:
 
 ```bash
-python3 .github/scripts/reconcile-netbox-devices.py \
+uv run python3 .github/scripts/reconcile-netbox-devices.py \
   --inventory-file "${HOME}/virtual-bmh-inventory.json" \
   --url https://netbox.example.test \
   --token-file netbox-token.txt
@@ -123,7 +123,7 @@ the deployment), pass `--insecure`:
 ```bash
 OSAC_NETBOX_URL=http://osac-infra-netbox.osac-infra.svc.cluster.local \
 OSAC_NETBOX_TOKEN="${NETBOX_TOKEN}" \
-python3 .github/scripts/reconcile-netbox-devices.py \
+uv run python3 .github/scripts/reconcile-netbox-devices.py \
   --inventory-file "${HOME}/virtual-bmh-inventory.json" --insecure
 ```
 
@@ -146,18 +146,18 @@ after the deletions succeeded.
 ```bash
 set -e
 # remove every VM — this empties the inventory
-python3 .github/scripts/manage-virtual-bmh-vms.py delete \
+uv run python3 .github/scripts/manage-virtual-bmh-vms.py delete \
   --inventory-file "${HOME}/virtual-bmh-inventory.json" \
   $(jq -r '.hosts[].name' "${HOME}/virtual-bmh-inventory.json")
 
 # reconcile the emptied inventory: every BMH of the group goes too.
 # NetBox backend: same inventory, same connection settings as step 5 —
 # the emptied inventory removes the group's devices and BMC Secrets.
-KUBECONFIG=/path/to/kubeconfig python3 .github/scripts/reconcile-bmhs.py \
+KUBECONFIG=/path/to/kubeconfig uv run python3 .github/scripts/reconcile-bmhs.py \
   --inventory-file "${HOME}/virtual-bmh-inventory.json" \
   --namespace host-inventory
 # OSAC_NETBOX_URL=... OSAC_NETBOX_TOKEN=... \
-#   python3 .github/scripts/reconcile-netbox-devices.py \
+#   uv run python3 .github/scripts/reconcile-netbox-devices.py \
 #   --inventory-file "${HOME}/virtual-bmh-inventory.json"
 
 # host side
