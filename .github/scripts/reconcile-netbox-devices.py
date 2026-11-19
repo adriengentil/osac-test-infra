@@ -42,7 +42,6 @@ OSAC_TIMEOUT_SECONDS = 300
 # connection would hang the step until the job timeout kills it.
 NETBOX_TIMEOUT_SECONDS = 30
 
-T = TypeVar("T")
 
 # The device custom fields the bare-metal-fulfillment operator's
 # free-host query and credential lookup depend on: (name, NetBox type).
@@ -109,6 +108,9 @@ def build_netbox_api(url: str, token: str, ca_file: str | None, insecure: bool) 
         session.verify = ca_file if ca_file is not None else False
     api.http_session = session
     return api
+
+
+T = TypeVar("T")
 
 
 def run_netbox(operation: str, call: Callable[[], T]) -> T:
