@@ -11,8 +11,9 @@
 #                                     Secrets reconciled with the raw inventory
 #
 # Same VMs and Redfish emulation as setup-virtual-bmh.sh; only the
-# inventory differs: NetBox devices instead of BMHs — the operator
-# creates each BMH itself when it claims a device.
+# inventory differs: NetBox devices instead of BMHs — the
+# bare-metal-fulfillment operator creates each BMH on the fly from the
+# NetBox device when it claims it.
 #
 # This script owns the CI specifics only: CLONE_NAME-derived names
 # (teardown.sh derives the same) and the clone network gateway discovery.

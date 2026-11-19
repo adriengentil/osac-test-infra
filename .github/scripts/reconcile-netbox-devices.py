@@ -10,7 +10,7 @@ of reconcile-bmhs.py. Per run:
    inventory removes them all. Their Secret API BMC Secrets go too.
 3. Create one staged device per host, plus one BMC Secret per host in the
    OSAC Secret API labeled osac.openshift.io/netbox-device-<device-id>
-   for the operator's credential lookup.
+   for the bare-metal-fulfillment operator's credential lookup.
 
 Connection:
 - NetBox: --url/--token, or the OSAC_NETBOX_* env vars. Plain HTTP needs
@@ -49,8 +49,8 @@ NETBOX_TIMEOUT_SECONDS = 30
 
 T = TypeVar("T")
 
-# The device custom fields the operator's free-host query and credential
-# lookup depend on: (name, NetBox field type).
+# The device custom fields the bare-metal-fulfillment operator's
+# free-host query and credential lookup depend on: (name, NetBox type).
 CUSTOM_FIELDS = (
     ("osac_managed", "boolean"),
     ("osac_instance_id", "text"),
@@ -64,7 +64,8 @@ CUSTOM_FIELDS = (
 ROLE_COLOR = "9e9e9e"
 
 # The Secret API label that binds a BMC Secret to its NetBox device:
-# the operator lists Secrets by this label when it claims a device.
+# the bare-metal-fulfillment operator lists Secrets by this label
+# when it claims a device.
 DEVICE_LABEL_PREFIX = "osac.openshift.io/netbox-device-"
 
 
@@ -149,8 +150,9 @@ def _ensure_slug_record(
 def ensure_schema(api: Api, args: argparse.Namespace) -> dict[str, int]:
     """Ensure the objects and custom fields devices need; return their ids.
 
-    The provider owns the NetBox schema: the operator only ever reads
-    it, so a fresh NetBox must be bootstrapped before any device.
+    The provider owns the NetBox schema: the bare-metal-fulfillment
+    operator only ever reads it, so a fresh NetBox must be bootstrapped
+    before any device.
     """
     print("==> Ensuring the NetBox schema...")
     site_id = _ensure_slug_record(api.dcim.sites, slug=args.site, kind="site")
