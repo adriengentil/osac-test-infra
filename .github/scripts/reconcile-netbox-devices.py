@@ -1,8 +1,7 @@
-#!/usr/bin/env python3
 """Reconcile NetBox devices with a raw inventory file.
 
-One command for the whole device lifecycle — the NetBox-mode counterpart
-of reconcile-bmhs.py. Per run:
+The netbox-mode counterpart of reconcile-bmhs.py; the provider tool that
+stages the device pool the BMaaS e2e suites claim from. Per run:
 
 1. Ensure the NetBox schema: site, manufacturer, device type, role and
    the OSAC custom fields.
@@ -12,14 +11,9 @@ of reconcile-bmhs.py. Per run:
    OSAC Secret API labeled osac.openshift.io/netbox-device-<device-id>
    for the bare-metal-fulfillment operator's credential lookup.
 
-Connection:
-- NetBox: --url/--token, or the OSAC_NETBOX_* env vars. Plain HTTP needs
-  --insecure.
-- Secret API: the osac CLI on PATH, logged in.
-- pynetbox/requests import lazily, only when a session is configured, so
-  the unit tests run without them.
-
-Run directly: python3 .github/scripts/reconcile-netbox-devices.py --help
+Connection: --url/--token-file or the OSAC_NETBOX_* env vars; plain HTTP
+needs --insecure. The Secret API is reached through the osac CLI, logged
+in. The token is never logged.
 """
 from __future__ import annotations
 
@@ -63,6 +57,15 @@ CUSTOM_FIELDS = (
 # NetBox requires a color on device role creation; grey stays neutral.
 ROLE_COLOR = "9e9e9e"
 
+# Fixed CI/lab schema. The setup script, the workflow and the docs all
+# run with these; nothing passes the flags they replaced.
+NETBOX_SITE = "osac-lab"
+NETBOX_ROLE = "server"
+NETBOX_MANUFACTURER = "osac"
+NETBOX_DEVICE_TYPE = "virtual-host"
+HOST_TYPE = "default"
+SECRET_TENANT = "system"
+
 # The Secret API label that binds a BMC Secret to its NetBox device:
 # the bare-metal-fulfillment operator lists Secrets by this label
 # when it claims a device.
@@ -88,10 +91,9 @@ def run_osac(args: list[str], *, check: bool = True) -> subprocess.CompletedProc
 def build_netbox_api(url: str, token: str, ca_file: str | None, insecure: bool) -> Api:
     """Construct the pynetbox API; third-party imports stay lazy.
 
-    The session always mounts a timeout adapter — a plain requests.Session
-    has no default timeout, so a stalled NetBox connection would hang the
-    step until the job timeout kills it. TLS: system roots by default; a
-    CA file or the insecure opt-in overrides that.
+    The session always mounts a timeout adapter (requests has none by
+    default); TLS verifies against system roots unless a CA file or the
+    insecure opt-in is given.
     """
     import pynetbox
     import requests
@@ -102,7 +104,7 @@ def build_netbox_api(url: str, token: str, ca_file: str | None, insecure: bool) 
             kwargs["timeout"] = kwargs.get("timeout") or NETBOX_TIMEOUT_SECONDS
             return super().send(request, **kwargs)
 
-    api = run_netbox("api construction", lambda: pynetbox.api(url, token=token))
+    api = pynetbox.api(url, token=token)
     session = requests.Session()
     session.mount("http://", TimeoutAdapter())
     session.mount("https://", TimeoutAdapter())
@@ -115,21 +117,15 @@ def build_netbox_api(url: str, token: str, ca_file: str | None, insecure: bool) 
 def run_netbox(operation: str, call: Callable[[], T]) -> T:
     """Run one NetBox API call, re-raising request failures sanitized.
 
-    Response bodies and payloads are dropped: they carry device data,
-    and the sanitized form (method, endpoint, status) is all a caller
-    can act on anyway. Connection-level failures (DNS, refused, TLS)
-    carry no request; they become a sanitized class-name one-liner.
-    Other failures without a request attached (programming errors)
-    re-raise unchanged.
+    Response bodies and payloads are dropped — they carry device data;
+    the sanitized form (method, endpoint, status) is all a caller can
+    act on. Failures without a request attached re-raise unchanged.
     """
     try:
         return call()
     except Exception as exc:
         req = getattr(exc, "req", None)
         if req is None:
-            module = type(exc).__module__ or ""
-            if module == "requests" or module.startswith(("requests.", "urllib3.")):
-                raise RuntimeError(f"NetBox {operation} failed: {type(exc).__name__}") from None
             raise
         status = getattr(req, "status_code", "?")
         url = getattr(req, "url", None) or getattr(exc, "base", "<unknown endpoint>")
@@ -160,19 +156,19 @@ def ensure_schema(api: Api, args: argparse.Namespace) -> dict[str, int]:
     before any device.
     """
     print("==> Ensuring the NetBox schema...")
-    site_id = _ensure_slug_record(api.dcim.sites, slug=args.site, kind="site")
-    manufacturer_id = _ensure_slug_record(api.dcim.manufacturers, slug=args.manufacturer, kind="manufacturer")
+    site_id = _ensure_slug_record(api.dcim.sites, slug=NETBOX_SITE, kind="site")
+    manufacturer_id = _ensure_slug_record(api.dcim.manufacturers, slug=NETBOX_MANUFACTURER, kind="manufacturer")
     role_id = _ensure_slug_record(
-        api.dcim.device_roles, slug=args.role, kind="device role", create_kwargs={"color": ROLE_COLOR}
+        api.dcim.device_roles, slug=NETBOX_ROLE, kind="device role", create_kwargs={"color": ROLE_COLOR}
     )
     # Device types have no writable slug in recent NetBox releases: it is
     # derived from the model, so both take the same value.
-    device_type = run_netbox("device type lookup", lambda: api.dcim.device_types.get(slug=args.device_type))
+    device_type = run_netbox("device type lookup", lambda: api.dcim.device_types.get(slug=NETBOX_DEVICE_TYPE))
     if device_type is None:
-        print(f"  Creating device type {args.device_type}...")
+        print(f"  Creating device type {NETBOX_DEVICE_TYPE}...")
         device_type = run_netbox(
             "device type create",
-            lambda: api.dcim.device_types.create(manufacturer=manufacturer_id, model=args.device_type),
+            lambda: api.dcim.device_types.create(manufacturer=manufacturer_id, model=NETBOX_DEVICE_TYPE),
         )
     _ensure_custom_fields(api)
     return {"site": site_id, "role": role_id, "device_type": int(device_type.id)}
@@ -192,14 +188,14 @@ def _ensure_custom_fields(api: Api) -> None:
         )
 
 
-def device_custom_fields(host: Host, host_type: str) -> dict[str, Any]:
+def device_custom_fields(host: Host) -> dict[str, Any]:
     """The operator's free-host contract: managed, reachable, selectable."""
     return {
         "osac_managed": True,
         "osac_bmc_address": host.bmc_address,
         "osac_boot_mac": host.boot_mac,
         "osac_interface_macs": {"data-0": host.boot_mac},
-        "host_type": host_type,
+        "host_type": HOST_TYPE,
     }
 
 
@@ -246,25 +242,24 @@ def create_device(api: Api, host: Host, schema: dict[str, int], host_type: str) 
             site=schema["site"],
             device_type=schema["device_type"],
             status="staged",
-            custom_fields=device_custom_fields(host, host_type),
+            custom_fields=device_custom_fields(host),
         ),
     )
 
 
-def update_device_fields(device: Record, host: Host, host_type: str) -> bool:
-    """Patch a kept device's provider-owned custom fields when they drifted.
+def update_device_fields(device: Record, host: Host) -> bool:
+    """Rewrite a kept device's custom fields when they drifted from the inventory.
 
-    A VM recreated under the same name gets a new Redfish URL and MAC in
-    the inventory; without the patch the operator would still claim the
-    device (the free-host query does not check these fields) and fail
-    provisioning against the old BMC. The claim field is never touched.
+    A VM recreated under the same name gets a new Redfish URL and MAC; the
+    operator's free-host query does not check these fields, so a stale
+    device would be claimed and fail provisioning against the old BMC.
+    The claim field is never in the desired set.
     """
-    desired = device_custom_fields(host, host_type)
+    desired = device_custom_fields(host)
     current = dict(getattr(device, "custom_fields", None) or {})
-    drifted = {key: value for key, value in desired.items() if current.get(key) != value}
-    if not drifted:
+    if all(current.get(key) == value for key, value in desired.items()):
         return False
-    run_netbox("device update", lambda: device.update({"custom_fields": drifted}))
+    run_netbox("device update", lambda: device.update({"custom_fields": desired}))
     return True
 
 
@@ -285,14 +280,14 @@ def reconcile_devices(
             delete_bmc_secret(args, name)
             delete_device(api, device)
             continue
-        if update_device_fields(device, hosts_by_name[name], args.host_type):
+        if update_device_fields(device, hosts_by_name[name]):
             print(f"  Updating {name} (custom fields drifted from the inventory)...")
     device_ids = {name: str(device.id) for name, device in existing.items() if name in desired_names}
     for host in inventory.hosts:
         if host.name in device_ids:
             continue
         print(f"  Creating {host.name}: MAC={host.boot_mac}, BMC={host.bmc_address}")
-        device_ids[host.name] = str(create_device(api, host, schema, args.host_type).id)
+        device_ids[host.name] = str(create_device(api, host, schema).id)
     return device_ids
 
 
@@ -307,11 +302,10 @@ def bmc_secret_name(host_name: str) -> str:
 def list_secret_labels(args: argparse.Namespace) -> dict[str, dict[str, str]]:
     """Map Secret name -> labels for the tenant's OSAC Secrets.
 
-    One list call instead of one get per host. List responses omit
-    Secret data (a Get would return it), so nothing sensitive is read
-    or printed.
+    One list call per run; List omits Secret data, so nothing sensitive
+    is read.
     """
-    result = run_osac(["--tenant", args.secret_tenant, "get", "secrets", "-o", "json"])
+    result = run_osac(["--tenant", SECRET_TENANT, "get", "secrets", "-o", "json"])
     payload = json.loads(result.stdout)
     # A single result renders as a bare object, not a one-element array.
     secrets = [payload] if isinstance(payload, dict) else payload
@@ -327,13 +321,9 @@ def list_secret_labels(args: argparse.Namespace) -> dict[str, dict[str, str]]:
 def ensure_bmc_secrets(hosts: list[Host], device_ids: dict[str, str], args: argparse.Namespace) -> None:
     """One BMC Secret per host, labeled for its device.
 
-    Secret data is never read back: a Get would return it (only List
-    omits it), and the credentials would transit this tool for no
-    benefit. The device label decides instead:
-    - right label — a previous run created this Secret from the same
-      inventory entry; keep it as-is.
-    - stale label (the device was recreated with a new id) — delete and
-      recreate from the inventory, the source of truth for credentials.
+    Secret data is never read back (a Get would return it); the device
+    label decides: right label — keep; stale label (the device was
+    recreated with a new id) — recreate from the inventory.
     """
     print("==> Ensuring BMC Secrets in the OSAC Secret API...")
     existing = list_secret_labels(args)
@@ -344,7 +334,7 @@ def ensure_bmc_secrets(hosts: list[Host], device_ids: dict[str, str], args: argp
             continue
         if name in existing:
             print(f"  Recreating Secret {name} (device label changed)...")
-            run_osac(["--tenant", args.secret_tenant, "delete", "secret", name])
+            run_osac(["--tenant", SECRET_TENANT, "delete", "secret", name])
         else:
             print(f"  Creating Secret {name}...")
         # Credentials travel in temp files, never on the command line.
@@ -355,7 +345,7 @@ def ensure_bmc_secrets(hosts: list[Host], device_ids: dict[str, str], args: argp
             password_file.write_text(host.bmc_password)
             run_osac(
                 [
-                    "--tenant", args.secret_tenant,
+                    "--tenant", SECRET_TENANT,
                     "create", "secret",
                     "--name", name,
                     "--type", "opaque",
@@ -369,29 +359,24 @@ def ensure_bmc_secrets(hosts: list[Host], device_ids: dict[str, str], args: argp
 def delete_bmc_secret(args: argparse.Namespace, host_name: str) -> None:
     """Delete a host's BMC Secret; a missing Secret is not an error."""
     name = bmc_secret_name(host_name)
-    result = run_osac(["--tenant", args.secret_tenant, "delete", "secret", name], check=False)
-    output = (result.stderr or "") + (result.stdout or "")
-    # The CLI's two missing shapes: a delete matching nothing succeeds
-    # ("No objects ... were found matching ..."), and a Secret deleted
-    # server-side after resolution fails ("... doesn't exist").
-    tolerated = ("were found matching" in output) or ("doesn't exist" in output) or ("not found" in output.lower())
-    if result.returncode != 0 and not tolerated:
-        fail(f"osac delete secret {name} failed: {output.strip()}")
+    result = run_osac(["--tenant", SECRET_TENANT, "delete", "secret", name], check=False)
+    if result.returncode != 0:
+        # A delete matching nothing succeeds; anything else is a real failure.
+        fail(f"osac delete secret {name} failed: {(result.stderr or result.stdout).strip()}")
 
 
 def resolve_connection(args: argparse.Namespace) -> tuple[str, str, str | None, bool]:
     """Combine flags with the OSAC_NETBOX_* env fallbacks; validate."""
     url = args.url or os.environ.get("OSAC_NETBOX_URL", "").strip()
-    token = args.token or ""
-    if not token and args.token_file is not None:
+    token = ""
+    if args.token_file is not None:
         try:
             token = args.token_file.read_text().strip()
         except OSError as exc:
             fail(f"cannot read token file '{args.token_file}': {exc}")
-    if not token:
-        token = os.environ.get("OSAC_NETBOX_TOKEN", "").strip()
+    token = token or os.environ.get("OSAC_NETBOX_TOKEN", "").strip()
     ca_file = str(args.ca_file) if args.ca_file else os.environ.get("OSAC_NETBOX_CA_FILE", "").strip() or None
-    insecure = args.insecure or os.environ.get("OSAC_NETBOX_INSECURE", "").strip().lower() in ("1", "true", "yes")
+    insecure = args.insecure
     if not url:
         fail("NetBox URL is empty: pass --url or set OSAC_NETBOX_URL")
     if not token:
@@ -399,7 +384,7 @@ def resolve_connection(args: argparse.Namespace) -> tuple[str, str, str | None, 
     # Scheme check is case-insensitive: requests accepts HTTP:// and would
     # otherwise send the token over plaintext without the opt-in.
     if url[:7].lower() == "http://" and not insecure:
-        fail(f"NetBox URL {url!r} uses http://: pass --insecure (or set OSAC_NETBOX_INSECURE) to allow it")
+        fail(f"NetBox URL {url!r} uses http://: pass --insecure to allow it")
     return url, token, ca_file, insecure
 
 
@@ -409,26 +394,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--inventory-file", type=Path, required=True, help="raw inventory JSON to read")
     parser.add_argument("--url", help="NetBox base URL (default: env OSAC_NETBOX_URL)")
-    parser.add_argument("--token", help="NetBox API token (default: env OSAC_NETBOX_TOKEN)")
-    parser.add_argument("--token-file", type=Path, help="file holding the NetBox API token")
+    parser.add_argument("--token-file", type=Path, help="file holding the NetBox API token (default: env OSAC_NETBOX_TOKEN)")
     parser.add_argument(
         "--ca-file", type=Path, help="CA bundle PEM for NetBox TLS (default: env OSAC_NETBOX_CA_FILE)"
     )
     parser.add_argument(
-        "--insecure",
-        action="store_true",
-        help="allow plain-HTTP NetBox and skip TLS verification (default: env OSAC_NETBOX_INSECURE)",
+        "--insecure", action="store_true", help="allow plain-HTTP NetBox and skip TLS verification"
     )
-    parser.add_argument("--site", default="osac-lab", help="NetBox site slug for devices (default: osac-lab)")
-    parser.add_argument("--role", default="server", help="NetBox device role slug (default: server)")
-    parser.add_argument("--manufacturer", default="osac", help="NetBox manufacturer slug (default: osac)")
-    parser.add_argument(
-        "--device-type", default="virtual-host", help="NetBox device type slug (default: virtual-host)"
-    )
-    parser.add_argument(
-        "--host-type", default="default", help="host_type capability custom field value (default: default)"
-    )
-    parser.add_argument("--secret-tenant", default="system", help="OSAC tenant for the BMC Secrets (default: system)")
     return parser
 
 
@@ -452,8 +424,6 @@ def main(argv: list[str] | None = None) -> None:
             # token); List responses omit Secret data, so it is safe to show.
             print(detail, file=sys.stderr)
         sys.exit(exc.returncode)
-    except json.JSONDecodeError as exc:
-        fail(f"the osac CLI produced malformed JSON: {exc}")
     except subprocess.TimeoutExpired as exc:
         fail(f"command timed out after {exc.timeout} seconds: {' '.join(exc.cmd)}")
     except InventoryError as exc:

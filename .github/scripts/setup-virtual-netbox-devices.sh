@@ -38,9 +38,6 @@
 #                      chain (openshift-ingress/router-certs-default).
 #   NETBOX_TOKEN     — NetBox API token. Default: the api_token key of the
 #                      superuser Secret the NetBox chart pre-provisions.
-#   NETBOX_NAMESPACE — namespace of the NetBox release (default: osac-infra)
-#   NETBOX_SECRET    — NetBox superuser Secret name (default:
-#                      osac-infra-netbox-superuser)
 #
 # The raw inventory is written to
 #   ${HOME}/virtual-bmh-inventory-${CLONE_NAME}.json
