@@ -102,7 +102,7 @@ def build_netbox_api(url: str, token: str, ca_file: str | None, insecure: bool) 
             kwargs["timeout"] = kwargs.get("timeout") or NETBOX_TIMEOUT_SECONDS
             return super().send(request, **kwargs)
 
-    api = pynetbox.api(url, token=token)
+    api = run_netbox("api construction", lambda: pynetbox.api(url, token=token))
     session = requests.Session()
     session.mount("http://", TimeoutAdapter())
     session.mount("https://", TimeoutAdapter())
@@ -117,14 +117,19 @@ def run_netbox(operation: str, call: Callable[[], T]) -> T:
 
     Response bodies and payloads are dropped: they carry device data,
     and the sanitized form (method, endpoint, status) is all a caller
-    can act on anyway. Failures without a request attached (programming
-    errors) re-raise unchanged.
+    can act on anyway. Connection-level failures (DNS, refused, TLS)
+    carry no request; they become a sanitized class-name one-liner.
+    Other failures without a request attached (programming errors)
+    re-raise unchanged.
     """
     try:
         return call()
     except Exception as exc:
         req = getattr(exc, "req", None)
         if req is None:
+            module = type(exc).__module__ or ""
+            if module == "requests" or module.startswith(("requests.", "urllib3.")):
+                raise RuntimeError(f"NetBox {operation} failed: {type(exc).__name__}") from None
             raise
         status = getattr(req, "status_code", "?")
         url = getattr(req, "url", None) or getattr(exc, "base", "<unknown endpoint>")
@@ -246,6 +251,23 @@ def create_device(api: Api, host: Host, schema: dict[str, int], host_type: str) 
     )
 
 
+def update_device_fields(device: Record, host: Host, host_type: str) -> bool:
+    """Patch a kept device's provider-owned custom fields when they drifted.
+
+    A VM recreated under the same name gets a new Redfish URL and MAC in
+    the inventory; without the patch the operator would still claim the
+    device (the free-host query does not check these fields) and fail
+    provisioning against the old BMC. The claim field is never touched.
+    """
+    desired = device_custom_fields(host, host_type)
+    current = dict(getattr(device, "custom_fields", None) or {})
+    drifted = {key: value for key, value in desired.items() if current.get(key) != value}
+    if not drifted:
+        return False
+    run_netbox("device update", lambda: device.update({"custom_fields": drifted}))
+    return True
+
+
 def reconcile_devices(
     api: Api, inventory: RawInventory, schema: dict[str, int], args: argparse.Namespace
 ) -> dict[str, str]:
@@ -253,15 +275,18 @@ def reconcile_devices(
     print("==> Reconciling NetBox devices with the raw inventory...")
     existing = list_group_devices(api, inventory.name_prefix)
     desired_names = {host.name for host in inventory.hosts}
+    hosts_by_name = {host.name: host for host in inventory.hosts}
     for name, device in sorted(existing.items()):
-        if name in desired_names:
+        if name not in desired_names:
+            print(f"  Deleting {name} (no longer in the inventory)...")
+            # Secret first: if the device deletion then fails, the device stays
+            # listed and the rerun retries both. The other order could succeed at
+            # the device and orphan the Secret — nothing would list it anymore.
+            delete_bmc_secret(args, name)
+            delete_device(api, device)
             continue
-        print(f"  Deleting {name} (no longer in the inventory)...")
-        # Secret first: if the device deletion then fails, the device stays
-        # listed and the rerun retries both. The other order could succeed at
-        # the device and orphan the Secret — nothing would list it anymore.
-        delete_bmc_secret(args, name)
-        delete_device(api, device)
+        if update_device_fields(device, hosts_by_name[name], args.host_type):
+            print(f"  Updating {name} (custom fields drifted from the inventory)...")
     device_ids = {name: str(device.id) for name, device in existing.items() if name in desired_names}
     for host in inventory.hosts:
         if host.name in device_ids:
@@ -345,8 +370,13 @@ def delete_bmc_secret(args: argparse.Namespace, host_name: str) -> None:
     """Delete a host's BMC Secret; a missing Secret is not an error."""
     name = bmc_secret_name(host_name)
     result = run_osac(["--tenant", args.secret_tenant, "delete", "secret", name], check=False)
-    if result.returncode != 0 and "not found" not in (result.stderr + result.stdout).lower():
-        fail(f"osac delete secret {name} failed: {(result.stderr or result.stdout).strip()}")
+    output = (result.stderr or "") + (result.stdout or "")
+    # The CLI's two missing shapes: a delete matching nothing succeeds
+    # ("No objects ... were found matching ..."), and a Secret deleted
+    # server-side after resolution fails ("... doesn't exist").
+    tolerated = ("were found matching" in output) or ("doesn't exist" in output) or ("not found" in output.lower())
+    if result.returncode != 0 and not tolerated:
+        fail(f"osac delete secret {name} failed: {output.strip()}")
 
 
 def resolve_connection(args: argparse.Namespace) -> tuple[str, str, str | None, bool]:
@@ -416,7 +446,14 @@ def main(argv: list[str] | None = None) -> None:
         ensure_bmc_secrets(inventory.hosts, device_ids, args)
     except subprocess.CalledProcessError as exc:
         print(f"ERROR: command failed with exit code {exc.returncode}: {' '.join(exc.cmd)}", file=sys.stderr)
+        detail = (exc.stderr or "").strip()
+        if detail:
+            # The CLI's error text names the real cause (e.g. an expired
+            # token); List responses omit Secret data, so it is safe to show.
+            print(detail, file=sys.stderr)
         sys.exit(exc.returncode)
+    except json.JSONDecodeError as exc:
+        fail(f"the osac CLI produced malformed JSON: {exc}")
     except subprocess.TimeoutExpired as exc:
         fail(f"command timed out after {exc.timeout} seconds: {' '.join(exc.cmd)}")
     except InventoryError as exc:
