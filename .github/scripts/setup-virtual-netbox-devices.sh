@@ -131,7 +131,6 @@ fi
 # OSAC_NETBOX_CA_FILE — the reconcile verifies instead of skipping.
 # Transport policy for a passed URL is the reconcile's own: it rejects
 # plain HTTP without its explicit opt-in.
-RECONCILE_ARGS=(--inventory-file "${INVENTORY_FILE}")
 if [[ -z "${NETBOX_URL:-}" ]]; then
   NETBOX_HOST="$(oc get route netbox -n "${NETBOX_NAMESPACE}" -o jsonpath='{.spec.host}' 2>/dev/null || true)"
   if [[ -z "${NETBOX_HOST}" ]]; then
@@ -162,6 +161,7 @@ command -v uv >/dev/null 2>&1 || {
 }
 uv --directory "${REPO_ROOT}" sync --frozen
 
+RECONCILE_ARGS=(--inventory-file "${INVENTORY_FILE}")
 OSAC_NETBOX_URL="${NETBOX_URL}" \
 OSAC_NETBOX_TOKEN="${NETBOX_TOKEN}" \
   uv --directory "${REPO_ROOT}" run --frozen \
