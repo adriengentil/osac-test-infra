@@ -33,13 +33,11 @@
 #   SUSHY_CACHE_PORT — nginx ISO cache listen port (default: 8080)
 #   NETBOX_URL       — NetBox base URL. Default: the https URL of the
 #                      `netbox` Route the osac-infra chart creates in
-#                      NETBOX_NAMESPACE (the fallback passes the reconcile's
-#                      TLS-verification opt-out: the Route's edge certificate
-#                      is the router's, not trusted by CI runners).
+#                      NETBOX_NAMESPACE, verified against the router's CA
+#                      chain (openshift-ingress/router-certs-default).
 #   NETBOX_TOKEN     — NetBox API token. Default: the api_token key of the
 #                      superuser Secret the NetBox chart pre-provisions.
 #   NETBOX_NAMESPACE — namespace of the NetBox release (default: osac-infra)
-#   NETBOX_ALLOW_HTTP — explicit consent for a passed plain-HTTP URL
 #   NETBOX_SECRET    — NetBox superuser Secret name (default:
 #                      osac-infra-netbox-superuser)
 #
@@ -128,8 +126,11 @@ fi
 # NETBOX_URL comes from the caller (a lab NetBox, an exposed route) or
 # defaults to the `netbox` Route the osac-infra chart creates in
 # NETBOX_NAMESPACE. The chart Route is edge-terminated with the router's
-# certificate, which CI runners do not trust, so the Route fallback passes
-# the reconcile's TLS-verification opt-out; a passed URL keeps verification.
+# certificate, so the fallback also exports the router's own CA chain
+# (openshift-ingress/router-certs-default: leaf + CA in tls.crt) as
+# OSAC_NETBOX_CA_FILE — the reconcile verifies instead of skipping.
+# Transport policy for a passed URL is the reconcile's own: it rejects
+# plain HTTP without its explicit opt-in.
 RECONCILE_ARGS=(--inventory-file "${INVENTORY_FILE}")
 if [[ -z "${NETBOX_URL:-}" ]]; then
   NETBOX_HOST="$(oc get route netbox -n "${NETBOX_NAMESPACE}" -o jsonpath='{.spec.host}' 2>/dev/null || true)"
@@ -139,22 +140,14 @@ if [[ -z "${NETBOX_URL:-}" ]]; then
     exit 1
   fi
   NETBOX_URL="https://${NETBOX_HOST}"
-  RECONCILE_ARGS+=(--insecure)
-fi
-
-# A passed plain-HTTP URL needs NETBOX_ALLOW_HTTP=true as explicit
-# consent: the token would cross the network unencrypted.
-if [[ "${NETBOX_URL}" == http://* && "${NETBOX_ALLOW_HTTP:-}" != "true" ]]; then
-  echo "ERROR: NETBOX_URL ${NETBOX_URL} uses plain HTTP." >&2
-  echo "       Set NETBOX_ALLOW_HTTP=true to consent to sending the NetBox token unencrypted, or use an https URL." >&2
-  exit 1
-fi
-
-# Plain HTTP — a consented passed URL — needs the reconcile's explicit
-# opt-in; an https URL keeps TLS verification (unless it came from the
-# Route fallback above).
-if [[ "${NETBOX_URL}" == http://* ]]; then
-  RECONCILE_ARGS+=(--insecure)
+  NETBOX_CA_FILE="$(mktemp)"
+  trap 'rm -f "${NETBOX_CA_FILE}"' EXIT
+  if ! oc get secret -n openshift-ingress router-certs-default \
+    -o jsonpath='{.data.tls\.crt}' | base64 -d >"${NETBOX_CA_FILE}"; then
+    echo "ERROR: could not read openshift-ingress/router-certs-default for the Route CA." >&2
+    exit 1
+  fi
+  export OSAC_NETBOX_CA_FILE="${NETBOX_CA_FILE}"
 fi
 
 # --- Reconcile the NetBox devices and BMC Secrets with the raw inventory ---
