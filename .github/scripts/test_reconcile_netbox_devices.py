@@ -555,6 +555,28 @@ class EndToEndTests(unittest.TestCase):
             [{"op": "mount", "prefix": "http://"}, {"op": "mount", "prefix": "https://"}],
         )
 
+    def test_ca_file_env_sets_session_verification(self) -> None:
+        # The setup script's Route fallback exports the router CA chain
+        # through this env var; the session must verify against that file
+        # instead of the system roots.
+        ca_file = self.temp / "router-ca.pem"
+        ca_file.write_text("-----BEGIN CERTIFICATE-----\n")
+
+        result = self._run(
+            flags=[],
+            env_extra={
+                "OSAC_NETBOX_URL": "https://env.example.test",
+                "OSAC_NETBOX_TOKEN": "env-token",
+                "OSAC_NETBOX_CA_FILE": str(ca_file),
+            },
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(
+            [call for call in self._netbox_calls() if call["op"] == "session"],
+            [{"op": "session", "verify": str(ca_file)}],
+        )
+
     def test_env_vars_configure_the_connection(self) -> None:
         result = self._run(
             flags=[],

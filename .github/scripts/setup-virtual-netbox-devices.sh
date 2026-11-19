@@ -104,6 +104,14 @@ SUSHY_CACHE_PORT="${SUSHY_CACHE_PORT}" \
   bash "${SCRIPT_DIR}/setup-sushy-tools.sh"
 
 # --- Create the VMs and the raw inventory ---
+# Every python script runs through this repository's uv environment
+# (see the header): uv must be on PATH, and one sync serves all of them.
+command -v uv >/dev/null 2>&1 || {
+  echo "ERROR: uv is not on PATH — run astral-sh/setup-uv before this script." >&2
+  exit 1
+}
+uv --directory "${REPO_ROOT}" sync --frozen
+
 VM_ARGS=(
   --inventory-file "${INVENTORY_FILE}"
   --network "${CT_NETWORK}"
@@ -112,7 +120,8 @@ VM_ARGS=(
   --redfish-port "${SUSHY_PORT}"
   --count "${BMH_COUNT}"
 )
-python3 "${SCRIPT_DIR}/manage-virtual-bmh-vms.py" create "${VM_ARGS[@]}"
+uv --directory "${REPO_ROOT}" run --frozen \
+  python3 "${SCRIPT_DIR}/manage-virtual-bmh-vms.py" create "${VM_ARGS[@]}"
 
 # --- Fetch the NetBox API token ---
 # The chart pre-provisions the superuser's token in the Secret's api_token
@@ -150,17 +159,9 @@ if [[ -z "${NETBOX_URL:-}" ]]; then
 fi
 
 # --- Reconcile the NetBox devices and BMC Secrets with the raw inventory ---
-# Run the reconciler in this repository's uv environment: pynetbox and
-# requests come from pyproject.toml + uv.lock, so nothing is installed
-# into the runner's interpreter.
-#   --directory — the repository root, whatever the caller's CWD
-#   --frozen    — the lock as-is, like the test container's uv sync
-command -v uv >/dev/null 2>&1 || {
-  echo "ERROR: uv is not on PATH — run astral-sh/setup-uv before this script." >&2
-  exit 1
-}
-uv --directory "${REPO_ROOT}" sync --frozen
-
+# The reconciler shares the repository uv environment synced above:
+# pynetbox and requests come from pyproject.toml + uv.lock, so nothing
+# is installed into the runner's interpreter.
 RECONCILE_ARGS=(--inventory-file "${INVENTORY_FILE}")
 OSAC_NETBOX_URL="${NETBOX_URL}" \
 OSAC_NETBOX_TOKEN="${NETBOX_TOKEN}" \
