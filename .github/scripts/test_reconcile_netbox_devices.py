@@ -114,6 +114,22 @@ STUB_PYNETBOX = textwrap.dedent(
     class Record:
         def __init__(self, **kwargs):
             self.__dict__.update(kwargs)
+            self._collection = None
+
+        def update(self, data):
+            if self._collection is None:
+                raise RuntimeError("update called on a detached record")
+            state = _state()
+            for entry in state[self._collection]:
+                if entry["id"] == self.id:
+                    if "custom_fields" in data:
+                        entry.setdefault("custom_fields", {}).update(data["custom_fields"])
+                    for key, value in data.items():
+                        if key != "custom_fields":
+                            entry[key] = value
+                    break
+            _save(state)
+            _log({"endpoint": self._collection, "op": "update", "id": self.id, "data": data})
 
     class SlugEndpoint:
         def __init__(self, key):
@@ -141,7 +157,11 @@ STUB_PYNETBOX = textwrap.dedent(
                 print(f"unexpected device filter: {kwargs}", file=sys.stderr)
                 sys.exit(89)
             _log({"endpoint": "devices", "op": "filter", "kwargs": kwargs})
-            devices = [Record(**entry) for entry in _state()["devices"]]
+            devices = []
+            for entry in _state()["devices"]:
+                record = Record(**entry)
+                record._collection = "devices"
+                devices.append(record)
             return [d for d in devices if (d.custom_fields or {}).get("osac_managed") is True]
 
         def create(self, **kwargs):
@@ -192,6 +212,10 @@ STUB_PYNETBOX = textwrap.dedent(
 
     def api(url, token=None):
         _log({"op": "api", "url": url, "token": token})
+        if os.environ.get("NETBOX_STUB_CONNECTION_ERROR"):
+            import requests
+
+            raise requests.ConnectionError("connection refused")
         return Api(url, token)
     '''
 )
@@ -204,6 +228,9 @@ STUB_REQUESTS = textwrap.dedent(
     import json
     import os
     from pathlib import Path
+
+    class ConnectionError(Exception):
+        """requests-shaped: module "requests", no .req — connection-level."""
 
     class Session:
         def __init__(self):
@@ -530,6 +557,96 @@ class EndToEndTests(unittest.TestCase):
         self.assertIn("delete secret virtual-bmh-test-01-bmc tenant=system", calls)
         self.assertIn("create secret virtual-bmh-test-01-bmc tenant=system", calls)
         self.assertEqual(self._secret_labels("virtual-bmh-test-01-bmc"), {"osac.openshift.io/netbox-device-46": "true"})
+
+    def test_kept_device_with_drifted_custom_fields_is_patched(self) -> None:
+        host = INVENTORY["hosts"][0]
+        stale_bmc = host["bmc_address"].replace("192.0.2.1", "192.0.2.99")
+        self._seed_state(
+            [
+                {
+                    "id": 46,
+                    "name": host["name"],
+                    "status": {"value": "staged", "label": "Staged"},
+                    "custom_fields": {
+                        "osac_managed": True,
+                        "osac_instance_id": "",
+                        "osac_bmc_address": stale_bmc,
+                        "osac_boot_mac": host["boot_mac"],
+                        "osac_interface_macs": {"data-0": host["boot_mac"]},
+                        "host_type": "default",
+                    },
+                }
+            ]
+        )
+
+        result = self._run(inventory={"name_prefix": "virtual-bmh-test", "hosts": [host]})
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Updating virtual-bmh-test-01 (custom fields drifted", result.stdout)
+        device = self._state()["devices"][0]
+        self.assertEqual(device["custom_fields"]["osac_bmc_address"], host["bmc_address"])
+        updates = [call for call in self._netbox_calls() if call.get("op") == "update"]
+        self.assertEqual(
+            updates,
+            [{"endpoint": "devices", "op": "update", "id": 46, "data": {"custom_fields": {"osac_bmc_address": host["bmc_address"]}}}],
+        )
+        # Kept, not recreated or deleted.
+        device_ops = [
+            (call["op"], call.get("name"))
+            for call in self._netbox_calls()
+            if call.get("endpoint") == "devices" and call["op"] in ("create", "delete")
+        ]
+        self.assertEqual(device_ops, [])
+
+    def test_kept_device_with_matching_fields_is_not_touched(self) -> None:
+        host = INVENTORY["hosts"][0]
+        self._seed_state(
+            [
+                {
+                    "id": 46,
+                    "name": host["name"],
+                    "status": {"value": "staged", "label": "Staged"},
+                    "custom_fields": {
+                        "osac_managed": True,
+                        "osac_instance_id": "",
+                        "osac_bmc_address": host["bmc_address"],
+                        "osac_boot_mac": host["boot_mac"],
+                        "osac_interface_macs": {"data-0": host["boot_mac"]},
+                        "host_type": "default",
+                    },
+                }
+            ]
+        )
+
+        result = self._run(inventory={"name_prefix": "virtual-bmh-test", "hosts": [host]})
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("Updating", result.stdout)
+        self.assertEqual([call for call in self._netbox_calls() if call.get("op") == "update"], [])
+
+    def test_missing_secret_is_tolerated_in_both_cli_shapes(self) -> None:
+        self._seed_state([_device_entry("virtual-bmh-test-ff", 48)])
+
+        # Default shape: a delete matching nothing succeeds (exit 0).
+        result = self._run(inventory={"name_prefix": "virtual-bmh-test", "hosts": []})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+        # Race shape: the Secret vanished server-side after resolution —
+        # exit 1 with "doesn't exist" must not fail the reconcile.
+        self._seed_state([_device_entry("virtual-bmh-test-ff", 48)])
+        result = self._run(
+            inventory={"name_prefix": "virtual-bmh-test", "hosts": []},
+            env_extra={"FAKE_OSAC_DELETE_RACE": "1"},
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual({device["name"] for device in self._state()["devices"]}, set())
+
+    def test_connection_failure_is_sanitized(self) -> None:
+        result = self._run(env_extra={"NETBOX_STUB_CONNECTION_ERROR": "1"})
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("ERROR: NetBox api construction failed: ConnectionError", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
 
     def test_plain_http_url_requires_opt_in(self) -> None:
         result = self._run(extra_args=("--url", "http://netbox.example.test"))

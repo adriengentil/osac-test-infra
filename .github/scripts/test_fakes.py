@@ -205,8 +205,15 @@ FAKE_OSAC = textwrap.dedent(
         name = args[2]
         state = secrets / f"{name}.json"
         if not state.exists():
-            print(f"Error: secret '{name}' not found", file=sys.stderr)
-            sys.exit(1)
+            if __import__("os").environ.get("FAKE_OSAC_DELETE_RACE"):
+                # The real CLI fails like this when the Secret vanished
+                # server-side after the CLI resolved it.
+                print(f"Can't delete secret '{name}' because it doesn't exist.", file=sys.stderr)
+                sys.exit(1)
+            # Mirror the real CLI: a delete matching nothing renders the
+            # no-matches template and succeeds.
+            print(f"No objects of type 'secret' were found matching identifier or name '{name}'.")
+            sys.exit(0)
         state.unlink()
         log(f"delete secret {name} tenant={tenant}")
         sys.exit(0)

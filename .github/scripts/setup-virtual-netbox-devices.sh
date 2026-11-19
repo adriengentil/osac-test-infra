@@ -86,8 +86,13 @@ fi
 GW_IP=$(${VIRSH} net-dumpxml "${CT_NETWORK}" | python3 -c "
 import sys, xml.etree.ElementTree as ET
 root = ET.parse(sys.stdin).getroot()
-print(root.find('.//ip').get('address'))
+ip = root.find('.//ip')
+print(ip.get('address') or '' if ip is not None else '')
 ")
+if [[ -z "${GW_IP}" ]]; then
+  echo "ERROR: network ${CT_NETWORK} has no gateway <ip address=...> in its libvirt XML." >&2
+  exit 1
+fi
 echo "Gateway IP (host): ${GW_IP}"
 
 # --- Activate Ironic (Provisioning CR) ---
@@ -129,7 +134,14 @@ uv --directory "${REPO_ROOT}" run --frozen \
 # key. Never printed, never passed on a command line.
 if [[ -z "${NETBOX_TOKEN:-}" ]]; then
   NETBOX_TOKEN="$(oc get secret "${NETBOX_SECRET}" -n "${NETBOX_NAMESPACE}" \
-    -o jsonpath='{.data.api_token}' | base64 -d)"
+    -o jsonpath='{.data.api_token}' | base64 -d)" || {
+    echo "ERROR: could not read the NetBox superuser Secret ${NETBOX_SECRET} (key api_token) in namespace ${NETBOX_NAMESPACE}." >&2
+    exit 1
+  }
+  if [[ -z "${NETBOX_TOKEN}" ]]; then
+    echo "ERROR: Secret ${NETBOX_SECRET} in namespace ${NETBOX_NAMESPACE} has no api_token key." >&2
+    exit 1
+  fi
 fi
 
 # --- Resolve the NetBox URL ---
@@ -152,8 +164,8 @@ if [[ -z "${NETBOX_URL:-}" ]]; then
   NETBOX_CA_FILE="$(mktemp)"
   trap 'rm -f "${NETBOX_CA_FILE}"' EXIT
   if ! oc get secret -n openshift-ingress router-certs-default \
-    -o jsonpath='{.data.tls\.crt}' | base64 -d >"${NETBOX_CA_FILE}"; then
-    echo "ERROR: could not read openshift-ingress/router-certs-default for the Route CA." >&2
+    -o jsonpath='{.data.tls\.crt}' | base64 -d >"${NETBOX_CA_FILE}" || [[ ! -s "${NETBOX_CA_FILE}" ]]; then
+    echo "ERROR: could not read a non-empty CA chain from openshift-ingress/router-certs-default." >&2
     exit 1
   fi
   export OSAC_NETBOX_CA_FILE="${NETBOX_CA_FILE}"
