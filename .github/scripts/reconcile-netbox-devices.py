@@ -23,12 +23,14 @@ import os
 import subprocess
 import sys
 import tempfile
+import warnings
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, TypeVar
 
 import pynetbox
 import requests
+from urllib3.exceptions import InsecureRequestWarning
 from pynetbox.core.api import Api
 from pynetbox.core.endpoint import Endpoint
 from pynetbox.core.response import Record
@@ -106,6 +108,9 @@ def build_netbox_api(url: str, token: str, ca_file: str | None, insecure: bool) 
     session.mount("https://", TimeoutAdapter())
     if ca_file is not None or insecure:
         session.verify = ca_file if ca_file is not None else False
+        if session.verify is False:
+            # The opt-in was explicit; urllib3 would warn per request.
+            warnings.filterwarnings("ignore", category=InsecureRequestWarning)
     api.http_session = session
     return api
 
@@ -232,7 +237,7 @@ def delete_device(api: Api, device: Record) -> None:
     run_netbox("device delete", lambda: api.dcim.devices.delete([device]))
 
 
-def create_device(api: Api, host: Host, schema: dict[str, int], host_type: str) -> Record:
+def create_device(api: Api, host: Host, schema: dict[str, int]) -> Record:
     return run_netbox(
         "device create",
         lambda: api.dcim.devices.create(
