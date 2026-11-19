@@ -21,7 +21,7 @@ cache. The listen IP is the libvirt network's gateway — the cluster
 nodes must reach the emulated BMCs:
 
 ```bash
-GW_IP=$(virsh -c qemu:///system net-dumpxml default | sed -n "s/.*<ip address='\([^']*\)'.*/\1/p")
+GW_IP=$(virsh net-dumpxml default | sed -n "s/.*<ip address='\([^']*\)'.*/\1/p")
 
 SUSHY_LISTEN_IP="${GW_IP}" \
 STORAGE_POOL_NAME="bmh-local" \
@@ -163,7 +163,7 @@ KUBECONFIG=/path/to/kubeconfig uv run python3 .github/scripts/reconcile-bmhs.py 
 # host side
 kill "$(cat "${HOME}/sushy-local/sushy.pid")"
 podman rm --force sushy-cache-local && podman volume rm sushy-cache-local
-virsh -c qemu:///system pool-destroy bmh-local && virsh -c qemu:///system pool-undefine bmh-local
+virsh pool-destroy bmh-local && virsh pool-undefine bmh-local
 rm -rf "${HOME}/virtual-bmh-disks" "${HOME}/sushy-local" \
   "${HOME}/sushy-vmedia-tmp" "${HOME}/virtual-bmh-inventory.json"
 ```
