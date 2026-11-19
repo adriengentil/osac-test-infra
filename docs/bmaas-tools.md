@@ -103,8 +103,8 @@ KUBECONFIG=/path/to/kubeconfig uv run python3 .github/scripts/reconcile-bmhs.py 
 
 When the cluster's bare-metal fulfillment runs the NetBox inventory
 backend, the same raw inventory drives NetBox devices instead of
-BareMetalHosts — the operator creates each BMH itself when it claims a
-device.
+BareMetalHosts — the bare-metal-fulfillment operator creates each BMH
+on the fly from the NetBox device when it claims it.
 
 Prerequisites: the `osac` CLI on PATH and logged in, plus the NetBox
 endpoint and token. `pynetbox` comes with this repository's Python
