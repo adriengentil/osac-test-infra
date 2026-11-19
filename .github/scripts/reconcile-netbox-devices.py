@@ -25,15 +25,16 @@ import sys
 import tempfile
 from collections.abc import Callable
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import Any, TypeVar
+
+import pynetbox
+import requests
+from pynetbox.core.api import Api
+from pynetbox.core.endpoint import Endpoint
+from pynetbox.core.response import Record
+from requests.adapters import HTTPAdapter
 
 from raw_inventory import Host, InventoryError, RawInventory, is_group_host_name
-
-if TYPE_CHECKING:
-    # Imported for annotations only: the test environment has no pynetbox.
-    from pynetbox.core.api import Api
-    from pynetbox.core.endpoint import Endpoint
-    from pynetbox.core.response import Record
 
 # 300s: a hung CLI must fail, not hang the job.
 OSAC_TIMEOUT_SECONDS = 300
@@ -89,16 +90,12 @@ def run_osac(args: list[str], *, check: bool = True) -> subprocess.CompletedProc
 
 
 def build_netbox_api(url: str, token: str, ca_file: str | None, insecure: bool) -> Api:
-    """Construct the pynetbox API; third-party imports stay lazy.
+    """Construct the pynetbox API.
 
     The session always mounts a timeout adapter (requests has none by
     default); TLS verifies against system roots unless a CA file or the
     insecure opt-in is given.
     """
-    import pynetbox
-    import requests
-    from requests.adapters import HTTPAdapter
-
     class TimeoutAdapter(HTTPAdapter):
         def send(self, request, **kwargs):
             kwargs["timeout"] = kwargs.get("timeout") or NETBOX_TIMEOUT_SECONDS
