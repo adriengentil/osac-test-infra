@@ -69,6 +69,9 @@ class TestCollect:
         org = wfe.ORG
         github.add(R("osac/actions/runs?status=queued&per_page=1"), FakeResponse(payload={"total_count": 2}))
         github.add(R("osac/actions/runs?status=in_progress&per_page=1"), FakeResponse(payload={"total_count": 1}))
+        # A quiet repo answers a real zero, which is published as zero.
+        github.add(R("quiet/actions/runs?status=queued&per_page=1"), FakeResponse(payload={"total_count": 0}))
+        github.add(R("quiet/actions/runs?status=in_progress&per_page=1"), FakeResponse(payload={"total_count": 0}))
         queued = [
             make_run(id=1, name="E2E VMaaS", status="queued", conclusion=None),
             make_run(id=2, name="pre-commit", status="queued", conclusion=None),
@@ -81,6 +84,9 @@ class TestCollect:
         github.add(R("osac/actions/runs?status=completed&per_page=50"),
                    FakeResponse(payload={"workflow_runs": [make_run(id=10, name="Unit tests")]}))
         github.add(R("osac/actions/runs/10/jobs?filter=latest&per_page=30"), FakeResponse(payload={"jobs": []}))
+        # A repo whose count raises: the exception path must not publish
+        # by-category gauges from the surviving repos either -- an
+        # undercount that looks like a real drop is not an answer.
         github.add(R("broken/actions/runs?status=queued&per_page=1"), RuntimeError("boom"))
 
         # Runs that were active last cycle and are gone now.
@@ -95,6 +101,11 @@ class TestCollect:
         github.add(R("osac/actions/runs/20/jobs?filter=latest&per_page=30"), FakeResponse(payload={"jobs": []}))
         github.add(R("osac/actions/runs/21"), FakeResponse(payload=make_run(id=21, status="in_progress")))
         github.add(R("osac/actions/runs/22"), RuntimeError("boom"))
+        # "broken" answers a real failure on its counts (not an omitted
+        # route): its gauges keep their previous values and the by-category
+        # gauges are skipped, per the _run_count None contract.
+        wfe.queued_runs.labels(org=org, repo="broken").set(5)
+        wfe.queued_by_category.labels(org=org, category="lint").set(7)
 
         # Recent: the cycle evicts jobs older than the 30-day job history,
         # and a fixed date stops being recent.
@@ -109,12 +120,23 @@ class TestCollect:
         assert gauge(wfe.queued_runs, org=org, repo="quiet") == 0
         assert gauge(wfe.queued_total, org=org) == 1
         assert gauge(wfe.zombie_total, org=org) == 1
-        assert gauge(wfe.queued_by_category, org=org, category="lint") == 1
-        assert gauge(wfe.queued_by_category, org=org, category="e2e") == 0
-        assert gauge(wfe.in_progress_by_category, org=org, category="e2e") == 1
+        # "broken" raised mid-collection, so the by-category gauges keep
+        # their previous values instead of publishing an undercount.
+        assert gauge(wfe.queued_by_category, org=org, category="lint") == 7
+        assert gauge(wfe.in_progress_by_category, org=org, category="e2e") == 0
+        # Its per-repo gauges keep their last values too.
+        assert gauge(wfe.queued_runs, org=org, repo="broken") == 5
         stored = {r["id"] for r in rows(exporter, "SELECT id FROM jobs")}
-        assert stored == {10, 20, 50}
-        assert {r["id"] for r in exporter.active_runs} == {1, 2, 3, 21}
+        # Run 20's completion is NOT stored this cycle: the dropped-active
+        # catch-up is gated on active_runs_complete, and "broken" raised.
+        # The reconciliation covers it within 48 hours -- honest delay, not
+        # a fabricated completion.
+        assert stored == {10, 50}
+        # Run 21 (still in_progress per its fetch) is not re-added: the
+        # dropped-active catch-up that would re-add it is skipped this
+        # cycle. It is neither completed nor lost -- the reconciliation
+        # covers it.
+        assert {r["id"] for r in exporter.active_runs} == {1, 2, 3}
         assert exporter._pr_backfill_done
         assert rows(exporter, "SELECT pr_display FROM jobs WHERE id = 50") == [{"pr_display": "#5"}]
 
@@ -123,6 +145,11 @@ class TestCollect:
         org = wfe.ORG
         wfe.queued_by_category.labels(org=org, category="release").set(7)
         github.add(R("osac/actions/runs?status=queued&per_page=1"), FakeResponse(payload={"total_count": 3}))
+        github.add(R("osac/actions/runs?status=in_progress&per_page=1"), FakeResponse(payload={"total_count": 1}))
+        # Every repo answers its counts, so the per-repo gauges publish; the
+        # active fetch itself fails, so the by-category gauges keep their
+        # previous values instead of an undercount that looks like a drop.
+        github.add(R("quiet/actions/runs?status=queued&per_page=1"), FakeResponse(payload={"total_count": 0}))
         github.add(R("quiet/actions/runs?status=in_progress&per_page=1"), FakeResponse(payload={"total_count": 1}))
         exporter.active_runs = [{"id": 99, "repo": "osac"}]
 

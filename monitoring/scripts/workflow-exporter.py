@@ -1213,7 +1213,7 @@ class WorkflowExporter:
                 "category": "e2e",
                 "status": result,
                 "conclusion": "" if result in ("in_progress", "queued") else result,
-                "duration_s": round(duration_s),
+                "duration_s": round(duration_s) if duration_s is not None else None,
                 "duration": self._fmt_duration(duration_s),
                 "updated_at": ended if result in ("success", "failure") else "",
                 "url": main.get("html_url") or record.get("url", ""),
@@ -2145,9 +2145,24 @@ class WorkflowExporter:
         while url:
             resp = self._get(url)
             if not resp.ok:
+                # A failed listing is not an organization with no
+                # repositories. With no previous answer cached, refuse:
+                # an empty list here is cached as "no active repos" for
+                # 30 minutes and every gauge reads a calm that is not real.
                 logger.error("Failed to list repos: %s %s", resp.status_code, resp.text[:200])
+                if not self._repos_cache:
+                    raise RuntimeError(
+                        f"the organization repository listing failed (HTTP {resp.status_code}) and no"
+                        " previous listing is cached, so this cycle refuses to publish empty repos"
+                    )
                 return self._repos_cache
-            repos.extend(r["name"] for r in resp.json() if not r.get("archived"))
+            body = resp.json()
+            if not isinstance(body, list):
+                logger.error("The repository listing answered something that is not a list")
+                if not self._repos_cache:
+                    raise RuntimeError("the organization repository listing answered no list")
+                return self._repos_cache
+            repos.extend(r["name"] for r in body if isinstance(r, dict) and not r.get("archived"))
             url = resp.links.get("next", {}).get("url")
 
         self._repos_cache = repos
@@ -2167,10 +2182,34 @@ class WorkflowExporter:
             resp = self._get(
                 f"{API_URL}/repos/{ORG}/{repo}/actions/runs?per_page=1"
             )
-            if resp.ok and resp.json().get("total_count", 0) > 0:
-                active.append(repo)
+            if resp.ok:
+                total = resp.json().get("total_count")
+                if isinstance(total, int):
+                    if total > 0:
+                        active.append(repo)
+                else:
+                    # A malformed 200 is a failed probe, not proof of
+                    # inactivity: keep the previous membership.
+                    was_active = bool(self._active_repos) and repo in self._active_repos
+                    logger.error(
+                        "The activity probe of %s named no total_count; keeping its"
+                        " previous membership (%s)", repo,
+                        "active" if was_active else "not active")
+                    if was_active:
+                        active.append(repo)
             elif resp.status_code == 409:
                 continue
+            else:
+                # A failed probe is not proof the repository has no runs:
+                # keep its previous membership instead of silently dropping
+                # a monitored repository -- and the gap check with it.
+                was_active = bool(self._active_repos) and repo in self._active_repos
+                logger.error(
+                    "The activity probe of %s failed (HTTP %s); keeping its previous"
+                    " membership (%s)", repo, resp.status_code,
+                    "active" if was_active else "not active"),
+                if was_active:
+                    active.append(repo)
 
         self._active_repos = active
         self._active_repos_ts = now
@@ -2199,7 +2238,10 @@ class WorkflowExporter:
                 try:
                     resp = self._get(url)
                     if resp.status_code == 200:
-                        for pr in resp.json():
+                        body = resp.json()
+                        if not isinstance(body, list):
+                            raise ValueError("the pulls answer is not a list")
+                        for pr in body:
                             branch = pr.get("head", {}).get("ref", "")
                             num = pr.get("number")
                             if branch and num:
@@ -2209,8 +2251,20 @@ class WorkflowExporter:
                                 )
                             if state == "closed" and pr.get("merged_at"):
                                 self._upsert_pr_merge(repo, pr)
-                except Exception:
-                    logger.debug("Failed to fetch PRs for %s/%s", repo, state)
+                    else:
+                        raise RuntimeError(f"HTTP {resp.status_code}")
+                except Exception as error:
+                    # A failed listing permanently loses PR attribution for
+                    # every run completed this cycle (the row is stored with
+                    # an empty pr_display and never revisited), so it is an
+                    # ERROR. Entries already read this cycle stay (they are
+                    # fresher than the cache); the cached ones fill the rest.
+                    logger.error(
+                        "The %s pull request listing of %s failed (%s); keeping the"
+                        " freshest mapping available", state, repo, error,
+                    )
+                    previous = (self._pr_map or {}).get(repo) or {}
+                    mapping = {**previous, **mapping}
             pr_map[repo] = mapping
         self._pr_map = pr_map
         self._pr_map_ts = now
@@ -2605,14 +2659,18 @@ class WorkflowExporter:
         """Build a flat dict for the JSON API from a workflow run."""
         started = run.get("run_started_at") or run.get("created_at", "")
         ended = run.get("updated_at", "")
-        duration_s = 0
+        # A duration the stored timestamps cannot support is None ("not
+        # measured"), never 0: a 0-second run reads as a measured instant
+        # and silently joins every average.
+        duration_s = None
         if started and ended:
             try:
                 t0 = datetime.fromisoformat(started.replace("Z", "+00:00"))
                 t1 = datetime.fromisoformat(ended.replace("Z", "+00:00"))
                 duration_s = max(0, (t1 - t0).total_seconds())
             except (ValueError, TypeError):
-                pass
+                logger.warning("Run %s has unparseable timestamps (%r, %r); its duration is not measured",
+                               run.get("id"), started, ended)
 
         conclusion = run.get("conclusion") or ""
         status = run.get("status", "unknown")
@@ -2660,7 +2718,7 @@ class WorkflowExporter:
             "conclusion": conclusion,
             "event": run.get("event", "unknown"),
             "trigger": WorkflowExporter._extract_trigger(run),
-            "duration_s": round(duration_s),
+            "duration_s": round(duration_s) if duration_s is not None else None,
             "duration": WorkflowExporter._fmt_duration(duration_s),
             "actor": run.get("actor", {}).get("login", ""),
             "url": run.get("html_url", ""),
@@ -2681,6 +2739,8 @@ class WorkflowExporter:
 
     @staticmethod
     def _fmt_duration(seconds):
+        if seconds is None:
+            return "not measured"
         if seconds <= 0:
             return "-"
         m, s = divmod(int(seconds), 60)
@@ -2694,13 +2754,20 @@ class WorkflowExporter:
     # -- metric collection ---------------------------------------------------
 
     def _run_count(self, repo, status):
-        """Get total_count of runs with given status (single API call)."""
+        """The count of runs with the given status, or None when GitHub
+        did not answer. A failed count is not a backlog of zero: the caller
+        leaves the gauges untouched instead of publishing calm."""
         resp = self._get(
             f"{API_URL}/repos/{ORG}/{repo}/actions/runs?status={status}&per_page=1"
         )
         if not resp.ok:
-            return 0
-        return resp.json().get("total_count", 0)
+            logger.error("The %s run count of %s failed (HTTP %s)", status, repo, resp.status_code)
+            return None
+        total = resp.json().get("total_count")
+        if not isinstance(total, int):
+            logger.error("The %s run count of %s named no total_count", status, repo)
+            return None
+        return total
 
     def _is_zombie_run(self, repo, run):
         """True for a queued run that has no jobs after the grace period.
@@ -2792,7 +2859,18 @@ class WorkflowExporter:
                 if not resp.ok:
                     complete = False
                     break
-                for run in resp.json().get("workflow_runs", []):
+                body = resp.json()
+                page_runs = body.get("workflow_runs") if isinstance(body, dict) else None
+                if not isinstance(page_runs, list):
+                    # A malformed page is a failed page, not "no runs":
+                    # reading it as empty would zero the by-category gauges
+                    # as a complete answer.
+                    logger.error(
+                        "The %s run list of %s named no workflow_runs list", status, repo
+                    )
+                    complete = False
+                    break
+                for run in page_runs:
                     if run.get("event") in WorkflowExporter.IGNORED_EVENTS:
                         continue
                     record = self._make_job_record(run, repo)
@@ -2847,7 +2925,13 @@ class WorkflowExporter:
         )
         if not resp.ok:
             return []
-        return resp.json().get("workflow_runs", [])
+        body = resp.json()
+        runs = body.get("workflow_runs") if isinstance(body, dict) else None
+        if not isinstance(runs, list):
+            # A malformed page is a failed poll, not "no completions".
+            logger.error("The completed run list of %s named no workflow_runs list", repo)
+            return []
+        return runs
 
     def _fetch_recent_history(self, repo):
         """Fetch the most recent completed runs for initial history load.
@@ -2887,7 +2971,13 @@ class WorkflowExporter:
         resp = self._get(url)
         if not resp.ok:
             return None
-        return resp.json().get("jobs", [])
+        jobs = resp.json().get("jobs")
+        if not isinstance(jobs, list):
+            # A malformed answer is a failed fetch, not a jobless run: []
+            # here would be stored forever as a complete-looking run.
+            logger.error("The jobs answer of run %s named no jobs list", run_id)
+            return None
+        return jobs
 
     def _extract_failed_steps(self, jobs):
         """Extract failed step info from a list of job objects.
@@ -3055,7 +3145,14 @@ class WorkflowExporter:
                              repo, resp.status_code, resp.text[:200])
                 break
 
-            for run in resp.json().get("workflow_runs", []):
+            body = resp.json()
+            page_runs = body.get("workflow_runs") if isinstance(body, dict) else None
+            if not isinstance(page_runs, list):
+                # A malformed page is a failed page, not the end of the
+                # listing: reading it as empty would mark the window read.
+                logger.error("The backfill listing of %s named no workflow_runs list", repo)
+                break
+            for run in page_runs:
                 if run.get("event") in WorkflowExporter.IGNORED_EVENTS:
                     continue
                 run_id = run["id"]
@@ -3125,7 +3222,15 @@ class WorkflowExporter:
                          repo, since_str, until_str, probe.status_code, probe.text[:200])
             return 0, 0
 
-        total_count = probe.json().get("total_count", 0)
+        total_count = probe.json().get("total_count")
+        if not isinstance(total_count, int):
+            # A malformed probe is a failed probe: (0, 0) already means
+            # "window covered, nothing new", so a missing count must not
+            # read as that. Its siblings (_probe_day, _list_window_runs)
+            # validate the same way.
+            logger.error("Backfill probe of %s [%s..%s] named no total_count",
+                         repo, since_str, until_str)
+            return 0, 0
         if total_count > self.BACKFILL_SAFE_RESULT_LIMIT and (until_dt - since_dt) > timedelta(hours=1):
             mid = since_dt + (until_dt - since_dt) / 2
             logger.info("%s [%s..%s]: %d runs, bisecting at %s",
@@ -3639,6 +3744,10 @@ class WorkflowExporter:
         tot_queued = 0
         tot_zombies = 0
         tot_in_progress = 0
+        # False when any repo's counts failed: the org-wide totals derived
+        # from them must keep their previous values, not publish a smaller
+        # number that reads as a real drop.
+        counts_complete = True
         current_active = []
         # False if any repo's active-runs fetch was partial/failed this
         # cycle -- gates the by-category gauge update below (see
@@ -3660,6 +3769,22 @@ class WorkflowExporter:
             try:
                 q = self._run_count(repo, "queued")
                 ip = self._run_count(repo, "in_progress")
+                if q is None or ip is None:
+                    # A failed count is not a backlog of zero: leave this
+                    # repo's gauges at their last values and mark the
+                    # active picture incomplete, rather than publish calm.
+                    # Completed-run ingestion continues: it does not depend
+                    # on the count, and skipping it here would store new
+                    # completions without their Prometheus counters (the
+                    # reconcile later upserts them as already-seen).
+                    active_runs_complete = False
+                    counts_complete = False
+                    for run in self._recent_completed(repo):
+                        try:
+                            self._process_completed_run(repo, run)
+                        except Exception:
+                            logger.exception("Error processing completed run in %s", repo)
+                    continue
 
                 # Collect active (queued/in_progress) runs for the active list
                 z = 0
@@ -3699,10 +3824,21 @@ class WorkflowExporter:
 
             except Exception:
                 logger.exception("Error collecting metrics for %s", repo)
+                # A repo that raised mid-collection leaves the active
+                # picture incomplete: the by-category gauges derived from
+                # it must not publish an undercount that looks like a
+                # drop.
+                active_runs_complete = False
 
-        queued_total.labels(org=ORG).set(tot_queued)
-        zombie_total.labels(org=ORG).set(tot_zombies)
-        in_progress_total.labels(org=ORG).set(tot_in_progress)
+        if counts_complete:
+            queued_total.labels(org=ORG).set(tot_queued)
+            zombie_total.labels(org=ORG).set(tot_zombies)
+            in_progress_total.labels(org=ORG).set(tot_in_progress)
+        else:
+            # A repo's count failed: the sums are undercounts, not answers.
+            # The per-repo gauges already keep their last values; the org
+            # totals must too, or a partial failure reads as a real drop.
+            logger.warning("Org-wide queue totals keep their previous values: a repo's count failed")
 
         # By-category breakdown of the same org-wide totals above -- e2e
         # runs on self-hosted runners, a completely different resource
@@ -3777,6 +3913,16 @@ class WorkflowExporter:
                         f"{API_URL}/repos/{ORG}/{dropped_repo}/actions/runs/{run_id}"
                     )
                     if not resp.ok:
+                        # A failed fetch is not proof the run ended. The run
+                        # drops out of the active list this cycle -- visible
+                        # above as a WARNING -- and the reconciliation
+                        # covers its completion within 48 hours, proven by
+                        # the hourly gap check. Silent would be a fallback.
+                        logger.warning(
+                            "The dropped-active fetch of run %s (%s) failed (HTTP %s);"
+                            " its completion waits for the reconciliation",
+                            run_id, dropped_repo, resp.status_code,
+                        )
                         continue
                     run_json = resp.json()
                     if run_json.get("status") != "completed":
@@ -4645,7 +4791,9 @@ class WorkflowExporter:
         success_count = counts.get("success", 0)
         failure_count = counts.get("failure", 0)
         decisive = success_count + failure_count  # exclude cancelled
-        failure_rate = round(failure_count / decisive, 4) if decisive > 0 else 0
+        # A window with no decisive runs has no rate: 0 would read as
+        # "all passed", perfect health fabricated over nothing.
+        failure_rate = round(failure_count / decisive, 4) if decisive > 0 else None
         return {
             "success": success_count,
             "failure": failure_count,
@@ -4659,7 +4807,7 @@ class WorkflowExporter:
             # 1 - failure_rate rather than success_count/decisive so the
             # two rates always sum to exactly 1 (avoids float rounding
             # drift between two separately-rounded fractions).
-            "success_rate": round(1 - failure_rate, 4) if decisive > 0 else 0,
+            "success_rate": round(1 - failure_rate, 4) if failure_rate is not None else None,
             # How far back the exporter's in-memory data actually goes,
             # regardless of the query's own filters -- lets the dashboard
             # show "data since: X" instead of implying full coverage of
@@ -4825,11 +4973,11 @@ class WorkflowExporter:
             ]
             via_queue_count = sum(1 for r in rs if r["via_merge_queue"])
             retest_vals = [r["retest_count"] or 0 for r in rs]
-            avg_open = avg(open_vals) or 0
+            avg_open = avg(open_vals)
             avg_approval = avg(approval_vals)
             avg_queue_wait = avg(queue_wait_vals)
             avg_approval_to_queue = avg(approval_to_queue_vals)
-            median_open = median(open_vals) or 0
+            median_open = median(open_vals)
             median_approval = median(approval_vals)
             median_queue_wait = median(queue_wait_vals)
             median_approval_to_queue = median(approval_to_queue_vals)
@@ -6087,11 +6235,20 @@ class ExporterHandler(BaseHTTPRequestHandler):
             # cannot answer: an empty link is honest, a guessed one is not.
             registry = getattr(self.exporter, "_runs", None)
             captures = {}
+            registry_error = ""
             if data.get("mode") == "pr" and registry is not None:
                 try:
                     captures = registry.capture_ids_by_run()
-                except (OSError, ValueError, sqlite3.Error):
+                except (OSError, ValueError, sqlite3.Error) as error:
+                    # A registry read failure is not "no captures": an empty
+                    # link is honest, but the page must say the registry
+                    # could not be read instead of letting every run read
+                    # as unrecorded.
                     captures = {}
+                    registry_error = f"the capture registry could not be read: {error}"
+                    logger.error("The capture registry read of the prs page failed: %s", error)
+            if registry_error:
+                data.setdefault("notes", []).append(registry_error)
             if data.get("mode") == "pr" and captures:
                 for attempt in data.get("attempts") or []:
                     capture_ids = []
@@ -6200,7 +6357,15 @@ def main():
     # HTTP server is already running so /metrics and /api/jobs are available
     # (they'll return empty data until this finishes).
     logger.info("Loading recent job history...")
-    exporter.initial_load()
+    # A failed initial load must not kill the service before the polling
+    # loop can retry it: the reconcile and the gap check recover what a
+    # failed startup load missed, and the store-freshness alert fires
+    # while it keeps failing.
+    try:
+        exporter.initial_load()
+    except Exception:
+        logger.exception("Initial history load failed; the polling loop retries and the"
+                         " reconciliation covers the gap")
 
     while True:
         try:

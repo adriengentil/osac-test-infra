@@ -49,6 +49,7 @@ asks the same URL from many panels.
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import re
@@ -63,6 +64,8 @@ from urllib.parse import quote
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ci_observe_phases as phases
 import ci_observe_spans
+
+logger = logging.getLogger(__name__)
 
 ORG = os.getenv("GITHUB_ORG", "osac-project")
 KEEP_DAYS = int(os.getenv("CI_OBSERVE_KEEP_DAYS", "90"))
@@ -150,12 +153,20 @@ def time_parts(row):
 
     Waits are every poll_until wait the test made, in any phase; setup,
     actions (the call phase) and teardown are each phase minus its waits. The
-    four add up to the test's setup + call + teardown time.
+    four add up to the test's setup + call + teardown time. A phase the
+    trace did not measure is None, never 0: "not measured" must not read
+    as "took no time".
     """
-    setup = max(0.0, (row.get("setup_s") or 0) - (row.get("wait_setup_s") or 0))
-    actions = max(0.0, (row.get("call_s") or 0) - (row.get("wait_call_s") or 0))
-    teardown = max(0.0, (row.get("teardown_s") or 0) - (row.get("wait_teardown_s") or 0))
-    return setup, row.get("wait_s") or 0.0, actions, teardown
+
+    def phase(total, wait):
+        if total is None:
+            return None
+        return max(0.0, total - (wait or 0.0))
+
+    setup = phase(row.get("setup_s"), row.get("wait_setup_s"))
+    actions = phase(row.get("call_s"), row.get("wait_call_s"))
+    teardown = phase(row.get("teardown_s"), row.get("wait_teardown_s"))
+    return setup, row.get("wait_s"), actions, teardown
 
 
 def test_url(test_key, days, suite="all"):
@@ -418,7 +429,9 @@ class Stores:
         return phases.read_audit_summary(os.path.join(folder, phases.AUDIT_FILE_NAME))
 
     def rollup_passes(self):
-        """{job: finished_at} of the hourly rollups' last passes."""
+        """{job: finished_at} of the hourly rollups' last passes, or None
+        when the table could not be read: a read failure is not 'the
+        rollup never ran', and it must not turn staleness detection off."""
         conn = self._open(self.trends_db)
         if conn is None:
             return {}
@@ -427,8 +440,9 @@ class Stores:
                 return {}
             rows = conn.execute("SELECT job, finished_at FROM rollup_passes")
             return {row["job"]: row["finished_at"] for row in rows}
-        except sqlite3.Error:
-            return {}
+        except sqlite3.Error as error:
+            logger.error("the rollup pass table could not be read: %s", error)
+            return None
         finally:
             conn.close()
 
@@ -668,21 +682,27 @@ class CIObserveInsights:
                     "GitHub; newer runs are missing"
                 )
         passes = self.stores.rollup_passes()
-        for job, label, noun, timer in (
-            ("trends", "Test results", "test results", "ci-observe-trends.timer"),
-            ("spans", "Inside the tests", "inside-the-tests numbers", "ci-observe-spans.timer"),
-        ):
-            finished = phases.parse_time(passes.get(job))
-            if finished is None:
-                parts.append(f"{label}: no pass recorded yet")
-                continue
-            parts.append(f"{label}: updated {finished:%Y-%m-%d %H:%M} UTC")
-            hours = (now - finished).total_seconds() / 3600
-            if hours > ROLLUP_STALE_HOURS:
-                notes.append(
-                    f"{noun} were last updated {hours:.0f} h ago ({timer}), so nothing after "
-                    f"{finished:%Y-%m-%d %H:%M} UTC is counted"
-                )
+        if passes is None:
+            # Unknown is not "never ran": the per-job lines below would
+            # say "no pass recorded yet" over a table nobody could read.
+            parts.append("Test results and inside-the-tests: the rollup pass table could"
+                         " not be read, so their freshness is unknown")
+        else:
+            for job, label, noun, timer in (
+                ("trends", "Test results", "test results", "ci-observe-trends.timer"),
+                ("spans", "Inside the tests", "inside-the-tests numbers", "ci-observe-spans.timer"),
+            ):
+                finished = phases.parse_time(passes.get(job))
+                if finished is None:
+                    parts.append(f"{label}: no pass recorded yet")
+                    continue
+                parts.append(f"{label}: updated {finished:%Y-%m-%d %H:%M} UTC")
+                hours = (now - finished).total_seconds() / 3600
+                if hours > ROLLUP_STALE_HOURS:
+                    notes.append(
+                        f"{noun} were last updated {hours:.0f} h ago ({timer}), so nothing after "
+                        f"{finished:%Y-%m-%d %H:%M} UTC is counted"
+                    )
         # The daily check against GitHub: what it compared and what differed.
         checked, found = phases.audit_lines(self.stores.audit_summary(), now, "e2e")
         parts.append(checked)
@@ -800,8 +820,15 @@ class CIObserveInsights:
             failing = len(failing_keys)
         else:
             notes.append("no per-test rollup is stored yet, so flaky and failing test counts are not measured")
-        runner_seconds = sum(fact["total_s"] or 0 for fact in finished)
-        failed_seconds = sum(fact["total_s"] or 0 for fact in failed)
+        # Runner hours sum only the runs that have a duration: a run with
+        # none is excluded (missing, never zero) and the tile says how many.
+        durations = [fact["total_s"] for fact in finished if fact["total_s"] is not None]
+        unmeasured = sum(1 for fact in finished if fact["total_s"] is None)
+        failed_durations = [fact["total_s"] for fact in failed if fact["total_s"] is not None]
+        if unmeasured:
+            notes.append(f"{unmeasured} run(s) have no duration and are not in the runner hours")
+        runner_seconds = sum(durations)
+        failed_seconds = sum(failed_durations)
         tile = {
             **rates,
             "pass_rate_prev": previous_rates.get("pass_rate"),
@@ -1012,14 +1039,22 @@ class CIObserveInsights:
                 "p90_s": percentile(by_day[day], 0.9),
                 "runs": len(by_day[day]),
             })
-        total_seconds = sum(fact["total_s"] or 0 for fact in finished)
+        # Hours sum only runs with a duration; a run without one is
+        # excluded (missing, never zero) and the totals say so.
+        known = [fact["total_s"] for fact in finished if fact["total_s"] is not None]
+        unmeasured = len(finished) - len(known)
+        if unmeasured:
+            notes.append(f"{unmeasured} run(s) have no duration and are not in the hours")
+        total_seconds = sum(known)
         totals = {
             "runs": len(finished),
             "passing_runs": len(passed),
             "runner_hours": round(total_seconds / 3600, 1),
-            "failed_hours": round(sum(f["total_s"] or 0 for f in finished if f["result"] == "failed") / 3600, 1),
+            "failed_hours": round(sum(f["total_s"] for f in finished
+                                      if f["result"] == "failed" and f["total_s"] is not None) / 3600, 1),
             "cancelled_hours": round(
-                sum(f["total_s"] or 0 for f in finished if f["result"] == "cancelled") / 3600, 1),
+                sum(f["total_s"] for f in finished
+                    if f["result"] == "cancelled" and f["total_s"] is not None) / 3600, 1),
             "mean_result_s": total_mean,
             "median_result_s": percentile([fact["total_s"] for fact in passed], 0.5),
             "p90_result_s": percentile([fact["total_s"] for fact in passed], 0.9),
@@ -1454,7 +1489,7 @@ class CIObserveInsights:
         grouped = defaultdict(list)
         for row in waits:
             grouped[(wait_group(row), row["resource_kind"])].append(row)
-        test_time = sum(row.get("duration_s") or 0 for row in tests)
+        test_time = sum(row["duration_s"] for row in tests if row["duration_s"] is not None)
         for (signature, kind), group in grouped.items():
             durations = [row["duration_s"] for row in group]
             out["waits"].append({
@@ -1519,7 +1554,7 @@ class CIObserveInsights:
         current_runs = {row["capture_id"] for row in runs if row["day"] >= window_day and row["state"] == "ok"}
         tests = self.stores.trends_rows("test_spans", "day >= ?", [window_day]) or []
         tests = [row for row in tests if row["capture_id"] in current_runs]
-        test_time = sum(row.get("duration_s") or 0 for row in tests)
+        test_time = sum(row["duration_s"] for row in tests if row["duration_s"] is not None)
         waits = [row for row in waits if row["capture_id"] in complete]
         current = [row for row in waits if row["day"] >= window_day]
         previous = [row for row in waits if row["day"] < window_day]
@@ -1589,11 +1624,20 @@ class CIObserveInsights:
             "waits": len(current),
             "wait_hours": round(sum(row["duration_s"] or 0 for row in current) / 3600, 1),
             "test_hours": round(test_time / 3600, 1),
+            # Waits the trace could not be attributed to a test: they are in
+            # the tables above, so the share must say how many are unproven.
+            "unattributed_waits": sum(row.get("unattributed_waits") or 0 for row in runs
+                                      if row["day"] >= window_day),
         }
         coverage["wait_share"] = ratio(coverage["wait_hours"], coverage["test_hours"])
         notes = []
         if not current_runs:
             notes.append("no recorded run in this window has a complete trace yet")
+        if coverage["unattributed_waits"]:
+            notes.append(
+                f"{coverage['unattributed_waits']} wait(s) could not be attributed to a test; they are"
+                " counted in the wait tables but not in any test's own time"
+            )
         return {
             "population": (
                 f"poll_until waits of recorded VMaaS, CaaS and BMaaS runs in the last {filters.days} days, from "
@@ -1614,23 +1658,33 @@ class CIObserveInsights:
     def _test_time_rows(tests, filters):
         """Where the recorded tests' time went, per suite and for all: hours
         of setup, waiting for the product, test actions and teardown. The
-        four parts add up to the tests' own time."""
+        four parts add up to the tests' own time. A phase a trace did not
+        measure is None and is excluded from its column and from the total."""
+        def known(part_index):
+            return [value for parts in split for value in [parts[part_index]] if value is not None]
+
+        def known_sum(part_index):
+            """The phase's measured hours, or None when nothing was
+            measured: an unmeasured phase is not 0 hours."""
+            values = known(part_index)
+            return round(sum(values) / 3600, 2) if values else None
+
         rows = []
         for suite in (*filters.suites, "all") if filters.suite == "all" else filters.suites:
             group = [row for row in tests if suite == "all" or row.get("suite") == suite]
             split = [time_parts(row) for row in group]
-            total = sum(sum(parts) for parts in split)
+            total = sum(value for parts in split for value in parts if value is not None)
             rows.append({
                 "category": phases.suite_label(suite),
                 "suite": suite,
                 "tests": len(group),
                 "recorded_runs": len({row["capture_id"] for row in group}),
-                "setup": round(sum(parts[0] for parts in split) / 3600, 2) if group else None,
-                "waits": round(sum(parts[1] for parts in split) / 3600, 2) if group else None,
-                "actions": round(sum(parts[2] for parts in split) / 3600, 2) if group else None,
-                "teardown": round(sum(parts[3] for parts in split) / 3600, 2) if group else None,
-                "wait_share": ratio(sum(parts[1] for parts in split), total),
+                "setup": known_sum(0) if group else None,
+                "waits": known_sum(1) if group else None,
+                "actions": known_sum(2) if group else None,
+                "teardown": known_sum(3) if group else None,
+                "wait_share": ratio(sum(known(1)), total),
             })
             for index, part in enumerate(("setup", "waits", "actions", "teardown")):
-                rows[-1][f"{part}_share"] = ratio(sum(parts[index] for parts in split), total)
+                rows[-1][f"{part}_share"] = ratio(sum(known(index)), total)
         return rows
