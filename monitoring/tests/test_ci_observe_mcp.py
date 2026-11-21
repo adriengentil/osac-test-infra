@@ -342,7 +342,11 @@ def test_the_well_known_documents_name_the_endpoints(server):
     assert answer.status == 200
     assert document["issuer"] == "https://outside"
     assert document["authorization_endpoint"] == "https://outside/authorize"
-    assert document["code_challenge_methods"] == ["S256"]
+    # RFC 8414 names: a client's schema rejects the document without them.
+    assert document["response_types_supported"] == ["code"]
+    assert document["grant_types_supported"] == ["authorization_code"]
+    assert document["token_endpoint_auth_methods_supported"] == ["none"]
+    assert document["code_challenge_methods_supported"] == ["S256"]
 
 
 def test_registration_accepts_only_loopback_redirects(server):
@@ -355,6 +359,30 @@ def test_registration_accepts_only_loopback_redirects(server):
                         body=json.dumps({"redirect_uris": ["https://evil.example/callback"]}),
                         headers={"Content-Type": "application/json"})
     assert answer.status == 400
+
+
+def test_a_401_leaves_the_keep_alive_connection_usable(server, config, monkeypatch):
+    """The 401 must not poison the connection: an unread request body
+    becomes the next request's request line, and the client's retry then
+    arrives as garbage (a 501 quoting the body). One connection, two
+    requests: refused, then served."""
+    import http.client
+    token = mcp.mint_token(config.session_secret, "dev", time.time())
+    connection = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=10)
+    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                       "params": {"protocolVersion": "2025-11-25"}})
+    connection.request("POST", "/mcp", body=body, headers={"Content-Type": "application/json"})
+    first = connection.getresponse()
+    first.read()
+    assert first.status == 401
+    connection.request("POST", "/mcp", body=body,
+                       headers={"Content-Type": "application/json",
+                                "Authorization": f"Bearer {token}"})
+    second = connection.getresponse()
+    payload = second.read()
+    connection.close()
+    assert second.status == 200
+    assert json.loads(payload)["result"]["protocolVersion"] == "2025-06-18"
 
 
 def test_an_mcp_call_without_a_token_is_refused_with_the_resource_metadata(server):
