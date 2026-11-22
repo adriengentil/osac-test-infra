@@ -62,6 +62,7 @@ import sys
 import time
 import urllib.parse
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from http.cookies import SimpleCookie
@@ -506,6 +507,18 @@ TOOLS: list[Tool] = [
         lambda pop: _population_question("Failure causes", pop),
     ),
     _insight_tool(
+        "failure_signatures",
+        "Why runs fail, from the failed runs' own logs: error signatures (the message with ids and"
+        " numbers replaced), how many failed and passing runs show each, first and last seen, and"
+        " example runs. Ranked by how much more failed runs show a signature than passing ones:"
+        " the comparison that separates a cause from noise every cluster logs. Each row's"
+        " logs_query is a Loki selector for the raw lines.",
+        "failures",
+        _rows_of("signatures"),
+        "ci-observe-failures", "ci-observe-e28094-why-runs-fail",
+        lambda pop: _population_question("Failure signatures", pop),
+    ),
+    _insight_tool(
         "time_to_result",
         "Time to result (median, p90, mean), the runner wait and runner hours.",
         "time",
@@ -576,8 +589,15 @@ def _run_failed_tests(config: Config, arguments: dict) -> Answer:
     notes = []
     if status == 200 and isinstance(body, dict):
         rows = [row for row in body.get("failed_tests") or [] if isinstance(row, dict)][:MAX_ROWS]
-        if not rows:
-            notes = [f"the junit.xml of {capture_id} lists no failed test"]
+        # A run that failed before its tests answers with its indexed
+        # error lines: "what failed in this run" has an answer even when
+        # no test ever ran.
+        lines = [row for row in body.get("error_lines") or [] if isinstance(row, dict)]
+        if not rows and lines:
+            rows = lines[:MAX_ROWS]
+        notes = list(body.get("notes") or [])
+        if not rows and not lines:
+            notes.append(f"the junit.xml of {capture_id} lists no failed test")
     elif isinstance(body, dict) and body.get("error"):
         not_answerable = f"{capture_id}: {body['error']}"
     else:
@@ -602,6 +622,13 @@ def _list_runs(config: Config, arguments: dict) -> Answer:
     repo = _need_str(arguments, "repo", REPOS)
     days = _need_int(arguments, "days", 1, RUNS_MAX_DAYS)
     params = {"days": str(days), "repo": repo, "suite": suite, "result": result, "limit": str(MAX_ROWS)}
+    question = f"{result} runs of the {suite} suite in {repo}, last {days} days"
+    end = arguments.get("end")
+    if isinstance(end, str) and end.strip():
+        # A window ending in the past: the runs of the week a regression
+        # started, without paging past everything newer.
+        params["end"] = end.strip()
+        question = f"{result} runs of the {suite} suite in {repo}, the {days} days before {end.strip()}"
     status, body = fetch_json(config, f"/api/ci-observe/runs?{urllib.parse.urlencode(params)}")
     rows = []
     not_answerable = ""
@@ -615,7 +642,7 @@ def _list_runs(config: Config, arguments: dict) -> Answer:
     else:
         not_answerable = f"the exporter answered HTTP {status} for the runs document"
     return Answer(
-        question=f"{result} runs of the {suite} suite in {repo}, last {days} days",
+        question=question,
         rows=rows,
         api_url=f"{config.exporter_url}/api/ci-observe/runs?{urllib.parse.urlencode(params)}",
         grafana_url=(f"{config.grafana_url}/d/ci-observe-runs-home/ci-observe-e28094-runs"
@@ -653,6 +680,83 @@ def _pull_request_stats(config: Config, arguments: dict) -> Answer:
         window=None,
         not_answerable=not_answerable,
         notes=list(body.get("notes") or []) if isinstance(body, dict) else [],
+    )
+
+
+def _window_boundary(end_text, days):
+    """(end iso, fetch days) for a window ending at `end_text`: the days
+    to fetch must reach back to the window's start (end minus days), not
+    to now minus days, or the store never serves the window's rows."""
+    try:
+        end = datetime.strptime(end_text, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    except ValueError:
+        try:
+            end = datetime.fromisoformat(end_text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if end.tzinfo is None:
+        end = end.replace(tzinfo=timezone.utc)
+    now = datetime.now(timezone.utc)
+    if end > now:
+        return None
+    reach = (now - (end - timedelta(days=days))).days + 1
+    return end.strftime("%Y-%m-%dT%H:%M:%SZ"), max(1, min(reach, PRS_MAX_DAYS))
+
+
+def _pull_requests(config: Config, arguments: dict) -> Answer:
+    """The window's pull requests as rows: number, title, author, when it
+    merged, its queue attempts and ejections. This is the "what merged
+    around the drop" tool -- the change list behind a pass-rate move."""
+    repo = _need_str(arguments, "repo", REPOS)
+    days = _need_int(arguments, "days", 1, PRS_MAX_DAYS)
+    state = arguments.get("state")
+    if not isinstance(state, str) or state not in ("all", "merged", "open", "closed"):
+        raise ToolError("state is required: all, merged, open or closed")
+    params = {"days": str(days), "repo": repo}
+    question = f"{state} pull requests of {repo}, last {days} days"
+    notes = []
+    end = arguments.get("end")
+    boundary = None
+    if isinstance(end, str) and end.strip():
+        boundary = _window_boundary(end.strip(), days)
+        if boundary is None:
+            raise ToolError(f"end={end!r} is neither a past date nor a past moment")
+        params["days"] = str(boundary[1])
+        question = f"{state} pull requests of {repo}, the {days} days before {end.strip()}"
+    status, body = fetch_json(config, f"/api/ci-observe/prs?{urllib.parse.urlencode(params)}")
+    rows = []
+    not_answerable = ""
+    if status == 200 and isinstance(body, dict):
+        every = body.get("pull_requests") if isinstance(body.get("pull_requests"), list) else body.get("prs")
+        rows = [row for row in (every or []) if isinstance(row, dict)]
+        if state != "all":
+            rows = [row for row in rows if (row.get("state") or "") == state]
+        if boundary:
+            # Keep the window's rows (merged on or before the end) and say
+            # what was cut: the store serves newest-first, so a window
+            # ending in the past hides nothing once the fetch reached its
+            # start.
+            rows = [row for row in rows
+                    if (row.get("merged_at") or row.get("opened_at") or "") <= boundary[0]]
+            notes.append(f"the {days} days before {end.strip()}; older merges are not listed")
+        if not rows:
+            not_answerable = f"the pull request store holds no {state} pull requests of {repo} in this window"
+    else:
+        not_answerable = f"the exporter answered HTTP {status} for the pull request document"
+    keep = ("number", "repo", "title", "author", "state", "opened_at", "merged_at", "closed_at",
+            "queue_attempt_count", "ejected_attempt_count", "requeued_attempt_count", "url", "detail_url")
+    rows = [{key: row.get(key) for key in keep if row.get(key) is not None} for row in rows]
+    rows.sort(key=lambda row: row.get("merged_at") or row.get("opened_at") or "", reverse=True)
+    return Answer(
+        question=question,
+        rows=rows[:MAX_ROWS],
+        api_url=f"{config.exporter_url}/api/ci-observe/prs?{urllib.parse.urlencode(params)}",
+        grafana_url=(f"{config.grafana_url}/d/ci-observe-pull-requests/ci-observe-e28094-pull-requests"
+                     f"?var-days={days}&var-pr_repo={repo}"),
+        about=(body.get("about") or [None])[0] if isinstance(body, dict) else None,
+        window=None,
+        not_answerable=not_answerable,
+        notes=notes + (list(body.get("notes") or []) if isinstance(body, dict) else []),
     )
 
 
@@ -726,7 +830,9 @@ TOOLS.extend([
     Tool(
         name="list_runs",
         description="The runs of one suite and result in a window, newest first (the job history"
-                    " keeps 30 days).",
+                    " keeps 30 days). end moves the window into the past (a date like 2026-11-07"
+                    " or an ISO moment), so the runs of the week something broke are one call"
+                    " instead of pages past everything newer.",
         schema={
             "type": "object",
             "properties": {
@@ -734,6 +840,7 @@ TOOLS.extend([
                 "result": {"type": "string", "enum": list(RESULTS)},
                 "repo": {"type": "string", "enum": list(REPOS)},
                 "days": {"type": "integer", "minimum": 1, "maximum": RUNS_MAX_DAYS},
+                "end": {"type": "string", "description": "window end: a date (2026-11-07) or ISO moment"},
             },
             "required": ["suite", "result", "repo", "days"],
         },
@@ -752,6 +859,25 @@ TOOLS.extend([
             "required": ["repo", "days"],
         },
         handler=_pull_request_stats,
+    ),
+    Tool(
+        name="pull_requests",
+        description="The pull requests of a window as rows: number, title, author, when it merged,"
+                    " queue attempts and ejections. The change list behind a pass-rate move: ask"
+                    " 'which PRs merged in this window' here, then pull_request_detail on the"
+                    " suspects. end moves the window into the past (a date like 2026-11-06), so"
+                    " the merges of the week a regression started are one call.",
+        schema={
+            "type": "object",
+            "properties": {
+                "repo": {"type": "string", "enum": list(REPOS)},
+                "days": {"type": "integer", "minimum": 1, "maximum": PRS_MAX_DAYS},
+                "state": {"type": "string", "enum": ["all", "merged", "open", "closed"]},
+                "end": {"type": "string", "description": "window end: a date (2026-11-06) or ISO moment"},
+            },
+            "required": ["repo", "days", "state"],
+        },
+        handler=_pull_requests,
     ),
     Tool(
         name="pull_request_detail",

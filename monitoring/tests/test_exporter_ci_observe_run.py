@@ -316,6 +316,13 @@ def test_invalid_and_missing_capture_id(evidence):
 # -- /api/ci-observe/failed-tests ------------------------------------------------
 
 PRIVATE_LIST_PATH = f"/repos/osac-project/osac-ci-artifacts/actions/artifacts?name={ARTIFACT_NAME}&per_page=100"
+
+def nothing_either_place(github):
+    """Empty listings at both places a run's artifact can be: the private
+    repository's name-filtered list and the run's own artifact list."""
+    github.add(PRIVATE_LIST_PATH, FakeResponse(payload={"total_count": 0, "artifacts": []}))
+    github.add(LIST_PATH, FakeResponse(payload={"total_count": 0, "artifacts": []}))
+
 PRIVATE_DOWNLOAD_PATH = "/repos/osac-project/osac-ci-artifacts/actions/artifacts/77/zip"
 PRIVATE_ARTIFACT_URL = "https://github.com/osac-project/osac-ci-artifacts/actions/runs/9001/artifacts/77"
 TOKEN_FIX = "PRIVATE_GITHUB_TOKEN needs read access to the Actions artifacts of osac-project/osac-ci-artifacts"
@@ -509,6 +516,37 @@ class TestFailedTestsErrors:
     def test_a_capture_id_that_names_no_suite(self, evidence, capture_id):
         assert "is not <vmaas|caas|bmaas>-<prN|main>-<run id>-a<attempt>" in refused(evidence, capture_id)
 
+    def test_an_indexed_run_without_junit_answers_with_its_error_lines(self, evidence, github, monkeypatch):
+        """A run that failed before its tests has no junit to read, and the
+        old answer was a refusal. When the artifact-log rollup indexed the
+        run, the document answers with the indexed error lines instead:
+        'what failed in this run' has an answer even when no test ran."""
+        seed_direct_run(evidence)
+        nothing_either_place(github)
+        monkeypatch.setattr(evidence, "_logs_indexed", lambda run_id: True)
+        monkeypatch.setattr(evidence, "_indexed_error_lines", lambda run_id: [
+            {"signature": "unable to read tree <id>", "kind": "aap-jobs",
+             "line": "fatal: unable to read tree (9b17fa51)", "ts": "1795273933000000000"},
+        ])
+
+        document = failed_tests(evidence)
+
+        assert document["failed_tests"] == []
+        assert document["error_lines"][0]["signature"] == "unable to read tree <id>"
+        assert any("no JUnit file could be read" in note for note in document["notes"])
+        assert any("artifact error lines" in note for note in document["notes"])
+
+    def test_a_run_the_rollup_did_not_index_keeps_its_refusal(self, evidence, github, monkeypatch):
+        seed_direct_run(evidence)
+        nothing_either_place(github)
+        monkeypatch.setattr(evidence, "_logs_indexed", lambda run_id: False)
+        asked = []
+        monkeypatch.setattr(evidence, "_indexed_error_lines", lambda run_id: asked.append(run_id))
+
+        refused(evidence)
+
+        assert asked == [], "Loki is not asked for a run the rollup never recorded"
+
     def test_no_token(self, exporter, github):
         seed_direct_run(exporter)
 
@@ -554,21 +592,23 @@ class TestFailedTestsErrors:
 
     def test_no_artifact_where_the_trigger_says(self, evidence, github):
         seed_direct_run(evidence)
-        github.add(PRIVATE_LIST_PATH, FakeResponse(payload={"total_count": 0, "artifacts": []}))
+        nothing_either_place(github)
 
         assert refused(evidence) == (
-            f"no {ARTIFACT_NAME} artifact in osac-project/osac-ci-artifacts, where scheduled runs keep it")
+            f"no {ARTIFACT_NAME} artifact in osac-project/osac-ci-artifacts or in"
+            f" run {RUN_ID} of osac-project/osac")
 
     def test_a_run_whose_upload_step_never_ran_says_so(self, evidence, github):
         """A cancelled job skips its upload step (a skipped step stores no
         timestamps), so no artifact ever existed: the error says that,
         because 'no artifact' alone reads like a vanished artifact."""
         seed_direct_run(evidence, steps=[{"name": "Run E2E tests", "duration_s": 600}])
-        github.add(PRIVATE_LIST_PATH, FakeResponse(payload={"total_count": 0, "artifacts": []}))
+        nothing_either_place(github)
 
         message = refused(evidence)
         assert message.startswith(
-            f"no {ARTIFACT_NAME} artifact in osac-project/osac-ci-artifacts, where scheduled runs keep it")
+            f"no {ARTIFACT_NAME} artifact in osac-project/osac-ci-artifacts or in"
+            f" run {RUN_ID} of osac-project/osac")
         assert "no upload step" in message and "no artifact was ever uploaded" in message
 
     def test_a_run_whose_upload_step_ran_does_not_claim_it_never_did(self, evidence, github):
@@ -576,27 +616,32 @@ class TestFailedTestsErrors:
             {"name": "Run E2E tests", "duration_s": 600},
             {"name": "Scan and upload artifacts", "duration_s": 30},
         ])
-        github.add(PRIVATE_LIST_PATH, FakeResponse(payload={"total_count": 0, "artifacts": []}))
+        nothing_either_place(github)
 
         assert refused(evidence) == (
-            f"no {ARTIFACT_NAME} artifact in osac-project/osac-ci-artifacts, where scheduled runs keep it")
+            f"no {ARTIFACT_NAME} artifact in osac-project/osac-ci-artifacts or in"
+            f" run {RUN_ID} of osac-project/osac")
 
     def test_a_run_whose_steps_were_never_read_makes_no_claim(self, evidence, github):
         seed_direct_run(evidence, steps=[])
-        github.add(PRIVATE_LIST_PATH, FakeResponse(payload={"total_count": 0, "artifacts": []}))
+        nothing_either_place(github)
 
         assert refused(evidence) == (
-            f"no {ARTIFACT_NAME} artifact in osac-project/osac-ci-artifacts, where scheduled runs keep it")
+            f"no {ARTIFACT_NAME} artifact in osac-project/osac-ci-artifacts or in"
+            f" run {RUN_ID} of osac-project/osac")
 
     def test_another_suites_or_runs_artifact_is_not_this_captures(self, evidence, github, wfe):
         seed_merge_queue_run(evidence)
         github.add(LIST_PATH, FakeResponse(payload={"total_count": 2, "artifacts": [
             artifact_entry(wfe.API_URL, name=ARTIFACT_NAME),
             artifact_entry(wfe.API_URL, art_id=43, name=f"osac-logs-caas-full-install-{RUN_ID + 1}")]}))
+        github.add(f"/repos/osac-project/osac-ci-artifacts/actions/artifacts"
+                   f"?name=osac-logs-caas-full-install-{RUN_ID}&per_page=100",
+                   FakeResponse(payload={"total_count": 0, "artifacts": []}))
 
         assert refused(evidence, f"caas-main-{RUN_ID}-a1") == (
-            f"no osac-logs-caas-full-install-{RUN_ID} artifact in run {RUN_ID} of osac-project/osac, "
-            "where merge_queue runs keep it")
+            f"no osac-logs-caas-full-install-{RUN_ID} artifact in"
+            f" run {RUN_ID} of osac-project/osac or in osac-project/osac-ci-artifacts")
         assert not [call for call in github.calls if call.endswith("/zip")]
 
     def test_a_trigger_with_no_artifact_place(self, evidence, github):

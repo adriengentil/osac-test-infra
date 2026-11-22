@@ -21,7 +21,7 @@ import threading
 from datetime import datetime, timezone, timedelta
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from typing import ClassVar
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, quote
 import urllib.parse
 
 import requests
@@ -5224,10 +5224,79 @@ class WorkflowExporter:
 
     def get_ci_observe_failed_tests_json(self, params):
         """The /api/ci-observe/failed-tests document: the failed tests of
-        one capture, from the JUnit file in its suite's artifact. Raises
-        EvidenceError when they cannot be read. Thin wrapper over
-        CIObserveRunEvidence.get_ci_observe_failed_tests_json."""
-        return self._run_evidence.get_ci_observe_failed_tests_json(params)
+        one capture, from the JUnit file in its suite's artifact. Thin
+        wrapper over CIObserveRunEvidence.get_ci_observe_failed_tests_json.
+
+        When the JUnit file cannot be read (a run that failed before its
+        tests, an expired artifact) and the artifact-log rollup indexed the
+        run's bundle, the document answers with the run's indexed error
+        lines instead of refusing: "what failed in this run" has an answer
+        even when no test ever ran. The lines carry their signature and
+        kind, and the notes say both why there is no junit and where the
+        lines come from. With nothing indexed the EvidenceError propagates
+        and the endpoint answers 502 with the reason, as before."""
+        try:
+            return self._run_evidence.get_ci_observe_failed_tests_json(params)
+        except EvidenceError as error:
+            capture_id = (params.get("capture_id", [""])[0] or "").strip()
+            match = re.search(r"-([0-9]+)-a[0-9]+$", capture_id)
+            # Only a run the artifact-log rollup recorded can have indexed
+            # lines; asking Loki for anything else is a query for nothing.
+            if match is None or not self._logs_indexed(match.group(1)):
+                raise
+            lines = self._indexed_error_lines(match.group(1))
+            if not lines:
+                raise
+            return {
+                "capture_id": capture_id,
+                "run_id": match.group(1),
+                "failed_tests": [],
+                "error_lines": lines,
+                "notes": [
+                    f"no JUnit file could be read: {error}",
+                    "these are the run's artifact error lines, indexed by the artifact-log rollup"
+                    " (the same lines are in Loki, linked from the run row)",
+                ],
+            }
+
+    def _indexed_error_lines(self, run_id, limit=20):
+        """The run's indexed artifact error lines from Loki, newest first:
+        [{signature, kind, line, ts}]. [] when nothing was indexed for the
+        run. None when Loki refused: "no lines" is a fact, a refusal is
+        not, and the caller keeps the original error then."""
+        query = quote(f'{{source="artifact", run_id="{run_id}", signature!=""}}')
+        # The whole retention, just under Loki's 30d1h query-length limit:
+        # a run's lines carry the run's own timestamps, so a default
+        # (last hour) range would answer nothing for any run older than
+        # an hour, and a range over the limit is a 400.
+        start = int((time.time() - 29 * 86400) * 1e9)
+        url = (f"{self._captures.loki_url}/loki/api/v1/query_range?query={query}"
+               f"&limit={limit}&start={start}&end={int(time.time() * 1e9)}")
+        try:
+            response = requests.get(url, timeout=10)
+        except requests.exceptions.RequestException as error:
+            logger.warning("the indexed error lines of run %s could not be read: %s", run_id, error)
+            return None
+        if not response.ok:
+            logger.warning("Loki answered HTTP %s for the error lines of run %s",
+                           response.status_code, run_id)
+            return None
+        try:
+            result = response.json().get("data", {}).get("result", [])
+        except ValueError:
+            return None
+        rows = []
+        for stream in result if isinstance(result, list) else []:
+            labels = stream.get("stream") or {}
+            for when, line in stream.get("values") or []:
+                rows.append({
+                    "signature": labels.get("signature") or "",
+                    "kind": labels.get("kind") or "",
+                    "line": line[:500],
+                    "ts": when,
+                })
+        rows.sort(key=lambda row: row["ts"], reverse=True)
+        return rows[:limit]
 
     # -- ci-observe runs (begin) --------------------------------------------
     #
@@ -5425,14 +5494,37 @@ class WorkflowExporter:
     def _iso_utc(value):
         return value.strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    def get_ci_observe_run_window(self, days, repo="", suite="", result="", failed_step: str = ""):
+    def _logs_indexed(self, run_id):
+        """Whether the artifact-log rollup recorded this run's bundle (any
+        suite). The run rows link to Loki only for what was indexed: a link
+        to nothing is a lie. An unreadable trends.db logs and answers no --
+        the link is an affordance, not an answer; the signatures document
+        is where a read failure says so."""
+        path = os.path.join(CACHE_DIR, "trends.db")
+        if not os.path.exists(path):
+            return False
+        try:
+            conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+            try:
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM artifact_logs WHERE run_id = ? AND state = 'indexed'",
+                    (str(run_id),)).fetchone()
+                return bool(row and row[0])
+            finally:
+                conn.close()
+        except sqlite3.Error as error:
+            logger.warning("the artifact log table could not be read for the run links: %s", error)
+            return False
+
+    def get_ci_observe_run_window(self, days, repo="", suite="", result="", failed_step: str = "", end=None):
         """Every run-level row in the window, one per run.
 
         The entry page's verdict cards count the whole window, so they cannot
         read a 200-row page. Same filter as get_ci_observe_run_page, no page
-        limit: about 3,700 rows for 30 days.
+        limit: about 3,700 rows for 30 days. `end` moves the window's end
+        into the past, like the page call's.
         """
-        now = datetime.now(timezone.utc)
+        now = end if isinstance(end, datetime) else datetime.now(timezone.utc)
         window_from = now - timedelta(days=days)
         where, args = self._ci_observe_run_where(
             window_from, now, repo=repo, suite=suite, failed_step=failed_step
@@ -5466,7 +5558,7 @@ class WorkflowExporter:
 
     def get_ci_observe_run_page(
         self, days, limit, before="", run_id="", repo="", suite="", result="",
-        failed_step: str = "",
+        failed_step: str = "", end=None,
     ):
         """One page of run-level E2E rows, joined to their captures.
 
@@ -5476,8 +5568,11 @@ class WorkflowExporter:
         ignores the window, so an old run still resolves. `repo`, `suite` and
         `failed_step` narrow the rows; `result` filters the grouped
         conclusion, so a run with one failed suite cannot appear as a success.
+        `end` moves the window's end into the past (a date or an ISO moment),
+        so a window nobody can query because newer runs bury it -- "the runs
+        of the week the pass rate fell" -- is one call.
         """
-        now = datetime.now(timezone.utc)
+        now = end if isinstance(end, datetime) else datetime.now(timezone.utc)
         window_from = now - timedelta(days=days)
         where_sql, args = self._ci_observe_run_where(
             window_from, now, before, run_id, repo=repo, suite=suite,
@@ -5515,6 +5610,7 @@ class WorkflowExporter:
                        THEN j.timeline_json END) AS failed_timeline,
                    COUNT(*) OVER () AS matched,
                    GROUP_CONCAT(DISTINCT c.capture_id) AS capture_ids,
+                   GROUP_CONCAT(DISTINCT NULLIF(j.runner_name, '')) AS runners,
                    MAX(CASE WHEN c.identity_source = 'info' THEN 1 ELSE 0 END) AS identity_info
             FROM jobs j
             LEFT JOIN captures c ON c.run_id = j.run_id
