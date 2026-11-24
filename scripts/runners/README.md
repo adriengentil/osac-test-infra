@@ -141,6 +141,19 @@ records selected libvirt/network state in the existing scanned artifact flow
 and writes a notice instead of copying the raw cluster-tool log, which may
 contain sensitive data.
 
+Before teardown, the MNO workflow also attempts to stage an existing clone
+kubeconfig when boot fails. When available, cluster collection captures MCO
+pod state, events, current/previous log tails, leader leases, ControllerConfig
+Infrastructure/DNS inputs, and the two `00-master` API/CoreDNS identity files.
+These diagnostics use the existing redaction and scanned upload flow. Earlier
+failures without a kubeconfig retain the selected host diagnostics only. Cluster
+collection is staged separately until redaction finishes, so a timeout or
+cancellation preserves the completed host diagnostics and excludes partial
+cluster output from upload.
+Staging failures also retain the host bundle. If the final cluster-file copy
+fails or is interrupted, the upload check discards its partial output and
+keeps only the completed host diagnostics.
+
 ### Registering a dedicated runner (different labels/purpose)
 
 `LABELS`, `BASE_DIR`, and `RUNNER_NAME_PREFIX` are overridable via env vars
