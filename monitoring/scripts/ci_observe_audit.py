@@ -463,12 +463,21 @@ def window_checks(db, github, api, repo, days, now, api_get=read_api):
 SUITES = ("vmaas", "caas", "bmaas", "it-fulfillment", "it-operator", "it-bmf", "it-caas")
 # The Tests workflow's integration suites, as the exporter stores them
 # (model.md's suite table): kept here by hand, like everything else this
-# checker reads, so it stays independent of the code it checks.
+# checker reads, so it stays independent of the code it checks. The flake
+# campaign names map to the same suites; their rows are left out of the
+# recount below, the way the Started by filter leaves them out of the
+# population it serves.
 IT_SUITE_WORKFLOWS = {
     "it-fulfillment": "IT fulfillment (Tests)",
     "it-operator": "IT operator (Tests)",
     "it-bmf": "IT BMF (Tests)",
     "it-caas": "IT CaaS (Tests)",
+}
+IT_FLAKE_SUITE_WORKFLOWS = {
+    "it-fulfillment": "IT fulfillment (Flake detection)",
+    "it-operator": "IT operator (Flake detection)",
+    "it-bmf": "IT BMF (Flake detection)",
+    "it-caas": "IT CaaS (Flake detection)",
 }
 # ci-observe/model.md: "Netris, stretched, CaaS agentless-net, full regression
 # and the named installs (...) test other scenarios and are never counted."
@@ -496,6 +505,9 @@ def documented_suite(workflow):
     if any(word in name for word in NEVER_COUNTED):
         return ""
     for suite, workflow_name in IT_SUITE_WORKFLOWS.items():
+        if name == workflow_name.lower():
+            return suite
+    for suite, workflow_name in IT_FLAKE_SUITE_WORKFLOWS.items():
         if name == workflow_name.lower():
             return suite
     for suite in SUITES:
@@ -552,11 +564,40 @@ def stored_e2e_rows(jobs_db, trends_db, since, until):
     return rows
 
 
+def run_unit(row):
+    """The re-run unit of a stored suite row: the run and the row's own job
+    when its timeline names exactly one (an integration leg's -- distinct
+    campaign repetitions of one suite are different job names in one run),
+    else the workflow name, which a re-run pair shares. The pages count
+    each unit's last attempt (model.md's pass rate), so the recount below
+    does too; implemented here rather than imported, like everything else
+    this checker reads."""
+    try:
+        timeline = json.loads(row.get("timeline_json") or "[]")
+    except (TypeError, ValueError):
+        timeline = []
+    if isinstance(timeline, list) and len(timeline) == 1 and isinstance(timeline[0], dict):
+        name = (timeline[0].get("name") or "").strip()
+        if name:
+            return name
+    return (row.get("workflow") or "").lower()
+
+
 def e2e_recount(rows, served):
     """The Overview's runs, passes, failures and cancellations per suite,
     against the stored rows counted by the documented scope. Also returns
     every stored workflow with the suite the documentation gives it, so a
     difference can be traced to the names that cause it."""
+    # Each re-run unit's last attempt only: a re-run stores a new row under
+    # a new job id and the superseded attempt's row stays stored (see
+    # run_unit), the way the served population counts.
+    kept = {}
+    for row in rows:
+        key = (str(row.get("run_id") or row.get("id")), run_unit(row))
+        held = kept.get(key)
+        if held is None or (row.get("run_attempt") or 1) > (held.get("run_attempt") or 1):
+            kept[key] = row
+    counted = {row["id"] for row in kept.values()}
     mine = {suite: Counter() for suite in (*SUITES, "all")}
     families = {}
     for row in rows:
@@ -569,7 +610,12 @@ def e2e_recount(rows, served):
         family["gate_rows"] += int(gate)
         family["conclusions"][row.get("conclusion") or "(none)"] += 1
         result = RESULTS.get((row.get("conclusion") or "").lower())
-        if not suite or gate or not result:
+        if not suite or gate or not result or row["id"] not in counted:
+            continue
+        if run_trigger(row) == "flake":
+            # The campaigns are counted only when asked for by name, and
+            # the served population this recount is checked against is the
+            # default one (trigger=all).
             continue
         for name in (suite, "all"):
             mine[name][result] += 1
@@ -939,6 +985,8 @@ def run_trigger(row):
     name = (row.get("workflow") or "").lower()
     if event == "merge_group" or name.endswith("(merge queue)"):
         return "merge_queue"
+    if name.endswith("(flake detection)") or name == "flake detection":
+        return "flake"
     if event == "pull_request" or name.startswith("e2e suite · ") or name.endswith((" pr suite", "(pull requests)")):
         return "pr"
     return {"schedule": "scheduled", "workflow_dispatch": "manual", "push": "push"}.get(event, event or "unknown")
