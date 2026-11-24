@@ -3,12 +3,81 @@ package main
 import (
 	"bytes"
 	"fmt"
+	"github.com/Masterminds/sprig/v3"
 	"net"
 	"text/template"
-	"github.com/Masterminds/sprig/v3"
 )
 
 type TmplMapEachDevBlock map[string]interface{}
+
+// aptTemplate is appended to every Ubuntu cloud-init user-data template. The lab VMs
+// install their packages from the internet on first boot, and a stalled or failed
+// apt download left a VM half set up with no error until a later wait timed out.
+//
+//   - "apt" makes apt retry each download and give up on a stalled one after 30s,
+//     and, when aptMirror is set, uses that mirror for both the main archive and
+//     the security pocket (the EC2 regional mirror carries both).
+//   - "aptWaitInstallDhclient" waits for the mirror's name to resolve before the
+//     first apt-get update: a softgate reaches the internet through the
+//     mgmt-server, which may still be setting up, and an update that finds no
+//     package lists leaves isc-dhcp-client uninstalled. Each failure is logged
+//     with an "apt-wait:" prefix.
+//   - "aptRetryMissingPackages" reinstalls what cloud-init's packages step failed
+//     to install: that step logs the failure and goes on, so the mgmt-server
+//     booted without openvpn. The server and softgate run it after the mirror
+//     wait, since their packages step can run before the mirror resolves. Each
+//     retry is logged with an "apt-retry:" prefix.
+const aptTemplate = `
+{{- define "apt" -}}
+apt:
+  conf: |
+    Acquire::Retries "5";
+    Acquire::http::Timeout "30";
+    Acquire::https::Timeout "30";
+{{- with .aptMirror }}
+  primary:
+    - arches: [default]
+      uri: {{ . }}
+  security:
+    - arches: [default]
+      uri: {{ . }}
+{{- end }}
+{{- end }}
+{{- define "aptHost" }}{{ if .aptMirror }}{{ (urlParse .aptMirror).hostname }}{{ else }}archive.ubuntu.com{{ end }}{{ end }}
+{{- define "aptWaitInstallDhclient" }}
+  - |
+    apt_host={{ template "aptHost" . }}
+    i=0
+    until getent hosts "$apt_host" >/dev/null; do
+        i=$((i + 1))
+        if [ "$i" -ge 60 ]; then
+            echo "apt-wait: $apt_host does not resolve after 5 minutes" >&2
+            break
+        fi
+        sleep 5
+    done
+    for i in 1 2 3 4 5; do
+        apt-get update && apt-get install -y isc-dhcp-client && break
+        echo "apt-wait: isc-dhcp-client install failed (try $i)" >&2
+        sleep 10
+    done
+{{- end }}
+{{- define "aptRetryMissingPackages" }}
+  - |
+    for i in 1 2 3 4 5; do
+        missing=""
+        for p in qemu-guest-agent {{ join " " .installedPackages }}; do
+            dpkg-query -W -f='${Status}' "$p" 2>/dev/null | grep -qx 'install ok installed' \
+                || missing="$missing $p"
+        done
+        [ -z "$missing" ] && break
+        echo "apt-retry: installing missing packages:$missing (try $i)" >&2
+        apt-get update
+        DEBIAN_FRONTEND=noninteractive apt-get install -y $missing
+        sleep 10
+    done
+{{- end }}
+`
 
 func domainXslt(vmSpecs ToTemplate) string {
 
@@ -126,6 +195,7 @@ users:
 # only cert auth via ssh (console access can still login)
 ssh_pwauth: false
 disable_root: false
+{{ template "apt" . }}
 packages:
   - qemu-guest-agent
 {{- range $item := .installedPackages }}
@@ -137,7 +207,8 @@ bootcmd:
 # run once for setup
 runcmd:
   - [ sh, -c, 'echo $(date) | sudo tee -a /root/runcmd.log' ]
-  - [ sh, -c, 'apt-get update && apt-get install isc-dhcp-client -y' ]
+{{ template "aptWaitInstallDhclient" . }}
+{{ template "aptRetryMissingPackages" . }}
   - [dhclient, -v]
   - |
     #!/bin/bash
@@ -167,7 +238,7 @@ runcmd:
             if ping -c 1 {{ .dnsServer }} &> /dev/null; then
                 echo "Internet is accessible."
                 # Check DNS resolution
-                if nslookup archive.ubuntu.com &> /dev/null; then
+                if getent hosts {{ template "aptHost" . }} > /dev/null; then
                     echo "DNS resolution is working."
                     break
                 else
@@ -190,7 +261,22 @@ runcmd:
     echo "deb [signed-by=/usr/share/keyrings/netris-public-keyring.gpg] http://repo.netris.ai/repo/ noble {{ .ctlInfo.AptRepo }}" | sudo tee /etc/apt/sources.list.d/netris.list
     # Wait until internet is accessible
     check_connectivity
-    apt-get update && apt-get install -y netris-hnp
+    # The mirror check above can pass while repo.netris.ai does not resolve yet
+    # (a private mirror), so wait for the Netris repository too and retry.
+    i=0
+    until getent hosts repo.netris.ai > /dev/null; do
+        i=$((i + 1))
+        if [ "$i" -ge 60 ]; then
+            echo "apt-wait: repo.netris.ai does not resolve after 5 minutes" >&2
+            break
+        fi
+        sleep 5
+    done
+    for i in 1 2 3 4 5; do
+        apt-get update && apt-get install -y netris-hnp && break
+        echo "apt-retry: netris-hnp install failed (try $i)" >&2
+        sleep 10
+    done
     sudo sed -i '/preserve_hostname: false/c\preserve_hostname: true' /etc/cloud/cloud.cfg
 write_files:
   - path: /root/netris-public.key
@@ -392,7 +478,7 @@ write_files:
       echo
 # written to /var/log/cloud-init-output.log
 final_message: "The system is finally up, after $UPTIME seconds"
-`)
+` + aptTemplate)
 		if err != nil {
 			panic(err)
 		}
@@ -447,6 +533,7 @@ users:
 # only cert auth via ssh (console access can still login)
 ssh_pwauth: false
 disable_root: false
+{{ template "apt" . }}
 packages:
   - qemu-guest-agent
 {{- range $item := .installedPackages }}
@@ -459,7 +546,8 @@ bootcmd:
 # run once for setup
 runcmd:
   - [ sh, -c, 'echo $(date) | sudo tee -a /root/runcmd.log' ]
-  - [ sh, -c, 'apt-get update && apt-get install isc-dhcp-client -y' ]
+{{ template "aptWaitInstallDhclient" . }}
+{{ template "aptRetryMissingPackages" . }}
   - [dhclient, -v]
   - |
     #!/bin/bash
@@ -489,7 +577,7 @@ runcmd:
             if ping -c 1 {{ .dnsServer }} &> /dev/null; then
                 echo "Internet is accessible."
                 # Check DNS resolution
-                if nslookup archive.ubuntu.com &> /dev/null; then
+                if getent hosts {{ template "aptHost" . }} > /dev/null; then
                     echo "DNS resolution is working."
                     break
                 else
@@ -589,7 +677,7 @@ write_files:
       fi
 # written to /var/log/cloud-init-output.log
 final_message: "The system is finally up, after $UPTIME seconds"
-`)
+` + aptTemplate)
 		if err != nil {
 			panic(err)
 		}
@@ -665,6 +753,7 @@ users:
 # only cert auth via ssh (console access can still login)
 ssh_pwauth: false
 disable_root: false
+{{ template "apt" . }}
 packages:
   - qemu-guest-agent
 {{- range $item := .installedPackages }}
@@ -776,7 +865,7 @@ write_files:
       !
 # written to /var/log/cloud-init-output.log
 final_message: "The system is finally up, after $UPTIME seconds"
-`)
+` + aptTemplate)
 		if err != nil {
 			panic(err)
 		}
@@ -863,6 +952,7 @@ users:
 # only cert auth via ssh (console access can still login)
 ssh_pwauth: false
 disable_root: false
+{{ template "apt" . }}
 packages:
   - qemu-guest-agent
 {{- range $item := .installedPackages }}
@@ -968,7 +1058,7 @@ write_files:
       !
 # written to /var/log/cloud-init-output.log
 final_message: "The system is finally up, after $UPTIME seconds"
-`)
+` + aptTemplate)
 		if err != nil {
 			panic(err)
 		}
@@ -1048,6 +1138,7 @@ users:
 # only cert auth via ssh (console access can still login)
 ssh_pwauth: false
 disable_root: false
+{{ template "apt" . }}
 packages:
   - qemu-guest-agent
 {{- range $item := .installedPackages }}
@@ -1059,6 +1150,7 @@ bootcmd:
 # run once for setup
 runcmd:
   - [ sh, -c, 'echo $(date) | sudo tee -a /root/runcmd.log' ]
+{{ template "aptRetryMissingPackages" . }}
   - [ sh, -c, 'cp /tmp/dhcpd.conf /etc/dhcp/dhcpd.conf' ]
   - [ sh, -c, 'systemctl restart isc-dhcp-server.service' ]
   - [ sh, -c, 'cp /root/.ssh/authorized_keys /var/www/html/authorized_keys' ]
@@ -1304,7 +1396,7 @@ write_files:
     permissions: '0644'
 # written to /var/log/cloud-init-output.log
 final_message: "The system is finally up, after $UPTIME seconds"
-`)
+` + aptTemplate)
 		if err != nil {
 			panic(err)
 		}
