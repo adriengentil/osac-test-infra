@@ -782,7 +782,7 @@ jobs:
 
       # No install dependency; sits here to pair with the netbox setup.
       - name: Setup virtual BareMetalHosts
-        if: inputs.inventory-backend != 'netbox'
+        if: inputs.inventory-backend == '' || inputs.inventory-backend == 'metal3'
         env:
           KUBECONFIG: ${{ runner.temp }}/kubeconfig
           BMH_NAMESPACE: ${{ inputs.bmh-namespace }}
