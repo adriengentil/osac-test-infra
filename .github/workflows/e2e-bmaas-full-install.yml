@@ -398,6 +398,16 @@ jobs:
           BMH_NAMESPACE: ${{ inputs.bmh-namespace }}
         run: bash .github/scripts/setup-virtual-bmh.sh
 
+      # The netbox flavor skips the virtual-BMH setup above, but its BMHs —
+      # created on the fly by the bare-metal-fulfillment operator — go through
+      # Ironic all the same, and the OSAC preflight blocks without the
+      # Provisioning CR. The later device setup re-runs this idempotently.
+      - name: Activate Ironic for the netbox backend
+        if: inputs.inventory-backend == 'netbox'
+        env:
+          KUBECONFIG: ${{ runner.temp }}/kubeconfig
+        run: bash .github/scripts/activate-ironic.sh
+
       # Loops over the `components` JSON array so any number of components
       # (one, two, or the 5-8 this repo is headed toward) can be built from
       # source in a single e2e run -- fixed named inputs (component-repo,
