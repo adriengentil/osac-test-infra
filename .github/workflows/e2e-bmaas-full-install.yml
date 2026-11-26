@@ -391,8 +391,8 @@ jobs:
           sudo chown "$(id -u):$(id -g)" "$RUNNER_TEMP/kubeconfig"
           chmod 600 "$RUNNER_TEMP/kubeconfig"
 
-      # Every backend needs Ironic before the install: the preflight
-      # requires the Provisioning CR.
+      # At the moment, every backend needs Ironic before the install: the
+      # preflight in OSAC chart requires the Provisioning CR.
       - name: Activate Ironic
         env:
           KUBECONFIG: ${{ runner.temp }}/kubeconfig
